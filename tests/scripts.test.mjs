@@ -2,7 +2,7 @@
  * scripts.test — 两个随仓发布的运维脚本的判据（P2）。
  *
  * 它们不在 tsc 的编译面里，但都是"照着文档就会跑"的东西，错了同样是线上事故：
- * - `relay-start.sh` 曾经默认 `DRC_LOG_LEVEL=debug`，而中继在 debug 级会打印
+ * - `relay-start.mjs` 曾经默认 `DRC_LOG_LEVEL=debug`，而中继在 debug 级会打印
  *   **完整配对码**——"起一个本地中继"于是默认落一份完整码在终端/日志里；
  *   另外它用 `%"${VAR#????}"` 取前 4 位，token 短于 4 字符时求值出的是**整个值**。
  * - `loadtest-conns.mjs` 原本没有 try/finally：装置自己抛错时子中继进程与日志流
@@ -23,7 +23,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
-const RELAY_START = join(ROOT, 'scripts', 'relay-start.sh')
+const RELAY_START = join(ROOT, 'scripts', 'relay-start.mjs')
 const LOADTEST = join(ROOT, 'scripts', 'loadtest-conns.mjs')
 
 /** 轮询等一个条件成立；超时返回 false，不抛（调用方自己给断言消息）。 */
@@ -36,20 +36,46 @@ async function waitUntil(predicate, timeoutMs) {
   return predicate()
 }
 
-test('relay-start.sh：默认日志级别是 info —— debug 级会把完整配对码打进日志', () => {
+test('relay-start.mjs：默认日志级别是 info —— debug 级会把完整配对码打进日志', () => {
   const source = readFileSync(RELAY_START, 'utf8')
+  // ⚠️ v2 的判据写的是 `/DRC_LOG_LEVEL:-info/`（那是 shell 的 `${X:-info}` 语法）。
+  // v3 改成 `.mjs` 之后默认值由 `??` 表达，锚点跟着改——**判据要测的东西没变**：
+  // 默认必须是显式的 info。两条正则都留着，删掉任何一条都会让这条判据变弱。
   assert.match(
     source,
-    /DRC_LOG_LEVEL:-info/,
+    /DRC_LOG_LEVEL\s*\?\?\s*'info'/,
     '默认级别必须是显式的 info：server.ts 在 debug 级打印完整配对码（pair token issued (debug)）',
   )
-  assert.ok(
-    !/DRC_LOG_LEVEL:-debug/.test(source),
+  assert.doesNotMatch(
+    source,
+    /DRC_LOG_LEVEL\s*\?\?\s*'debug'/,
     '照文档起一个中继不该默认把完整配对码落进终端/日志；要排错请显式 DRC_LOG_LEVEL=debug',
   )
+  // 反向判据：旧 shell 形态不该再出现（.mjs 里留着它说明有人把 shell 写法抄了回来）
+  assert.doesNotMatch(source, /DRC_LOG_LEVEL:-/, '这是 shell 的 ${X:-info} 写法，不该出现在 .mjs 里')
 })
 
-test('relay-start.sh：patch 文件里的短 token 一个字符都不打印（长度守卫）', async () => {
+test('readHostToken：patch 文件里的 hostToken 各种写法都能取到（v2 用 grep -oE 拼的）', async () => {
+  // 动态 import 拿纯函数出来测。v2 那条 `grep -oE | head -1 | sed -E` 没法被单测直接调，
+  // 换 .mjs 之后它就是一段纯函数，**每个形态都能逐格验**。
+  const { readHostToken } = await import(RELAY_START)
+  for (const [yaml, want] of [
+    ['plugins:\n  hostToken: abc123\n', 'abc123'],
+    ['hostToken: "quoted-token"\n', 'quoted-token'],
+    ["hostToken: 'single-quoted'\n", 'single-quoted'],
+    ['  hostToken:   spaced-out   \n', 'spaced-out'],
+    ['hostToken: with-hash # 这是注释\n', 'with-hash', '行尾注释要被去掉'],
+    ['a: 1\nhostToken: second-line\nb: 2\n', 'second-line', '取第一条命中'],
+    ['plugins:\n  other: x\n', '', '没有这一行 ⇒ 空字符串（不是抛异常）'],
+    ['', '', '空文件 ⇒ 空字符串'],
+  ]) {
+    assert.equal(readHostToken(yaml), want, `${JSON.stringify(yaml)} ⇒ ${JSON.stringify(want)}`)
+  }
+  // 反向判据：值里的 `#` 不该被当注释吃掉（只有**空白 + #** 才是注释）
+  assert.equal(readHostToken('hostToken: has#hash\n'), 'has#hash', '值里的 # 不是行尾注释')
+})
+
+test('relay-start.mjs：patch 文件里的短 token 一个字符都不打印（长度守卫）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'drc-start-'))
   try {
     // 短于 4 字符：`%"${TOKEN#????}"` 在旧写法里会求值出整个 token。
@@ -57,14 +83,14 @@ test('relay-start.sh：patch 文件里的短 token 一个字符都不打印（�
     const env = { ...process.env, DSH_PROFILE: dir, DRC_PORT: '0' }
     // 必须让脚本走"从 patch 文件读"的这条路：环境里有 DRC_HOST_TOKEN 就轮不到它。
     delete env.DRC_HOST_TOKEN
-    const child = spawn('sh', [RELAY_START], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(process.execPath, [RELAY_START], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     child.stdout.on('data', (c) => (out += c.toString()))
     child.stderr.on('data', (c) => (out += c.toString()))
     try {
       // 脚本是 `exec node …`：等到中继真的起来了，就说明整条路都跑通了。
       const up = await waitUntil(() => out.includes('relay listening'), 8000)
-      assert.ok(up, `relay-start.sh 没起来（或没打印启动行）：${out.slice(-400)}`)
+      assert.ok(up, `relay-start.mjs 没起来（或没打印启动行）：${out.slice(-400)}`)
       assert.ok(!out.includes('abc'), `短 token 的值被打出来了：${out.slice(0, 200)}`)
       assert.match(out, /短于 4 字符/, '短 token 要走守卫分支并说明只报了长度')
     } finally {

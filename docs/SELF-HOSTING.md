@@ -144,12 +144,12 @@ grep -nE 'DRC_(MAX_AUTH_ATTEMPTS|MAX_PAIR_ATTEMPTS|MAX_PAIR_ATTEMPTS_PER_SEC)\b'
 凭据，手工同步两次就会有一边改了另一边没改，表现是"永远 `bad_token`"）：
 
 ```sh
-./scripts/relay-start.sh              # 127.0.0.1:8787，跑 tsc 产物 dist/src/main.js
-DRC_PORT=9000 ./scripts/relay-start.sh
-./scripts/relay-start.sh --bundle     # 跑单文件产物，与生产形态完全一致
+./scripts/relay-start.mjs              # 127.0.0.1:8787，跑 tsc 产物 dist/src/main.js
+DRC_PORT=9000 ./scripts/relay-start.mjs
+./scripts/relay-start.mjs --bundle     # 跑单文件产物，与生产形态完全一致
 ```
 
-脚本行为（照 `scripts/relay-start.sh` 的实现）：优先用环境变量 `DRC_HOST_TOKEN`，没有才从
+脚本行为（照 `scripts/relay-start.mjs` 的实现）：优先用环境变量 `DRC_HOST_TOKEN`，没有才从
 `${DSH_PROFILE:-~/.dsh/profiles/desktop}/cordis.patch.yml` 里抓 `hostToken:` 那一行（只打印前
 4 位，完整值不外泄）；两处都没有就报错退出，不会起来一个"没人能连上"的进程。缺产物时提示先跑
 `pnpm build`。它固定导出 `DRC_BIND=127.0.0.1`、`DRC_LOG_LEVEL=debug`、`DRC_PAIR_TTL_MS=120000`
@@ -805,7 +805,7 @@ curl -s https://drc.example.com/healthz
 journalctl -u dsh-remote-control -o cat | grep '"level":"warn"'
 
 # 本机起一个（开发）
-./scripts/relay-start.sh --bundle
+./scripts/relay-start.mjs --bundle
 
 # 取证
 pnpm typecheck && pnpm test
