@@ -1,0 +1,83 @@
+name: Release
+
+# 打一个 `v*` 标签即发布：先跑一遍完整校验（与 CI 同款，标签也可能打在坏提交上），
+# 通过后把**单文件产物**连同 SHA-256 清单挂到一个 GitHub Release 上。中继**不发 npm**：
+# `dsh-remote-server` 这个包名在 npm 上已被第三方占用（`bondzhu` / `MRZHUH/dsh-remote-server`，
+# 一个"在 DSH 会话里 @ 服务器走 SSH 执行命令"的工具，与我们无关），2026-10-03 用户拍板
+# **先不发**。要发得先定名字（`dsh-remote-relay` / `drc-relay` 当时都空着），并且
+# **绝对不要把 `npm i -g dsh-remote-server` 写进任何文档**——那条命令装到的是别人的包。
+#
+# 产物必须挂在 Release 上：部署方式就是"拿这一个文件跑起来"，让自托管的人先 clone 再
+# `pnpm install && pnpm build` 等于把"少一层依赖树"这个卖点还回去了。带校验和是因为
+# 一个只靠 curl 分发的可执行文件，总得有个办法证明"下到的就是你建的那个"。
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: verify and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # 生成 release notes 需要完整历史
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      # lockfile 已提交（协议包 `dsh-remote-wire@1.0.0` 上了 npm 之后生成的），所以冻结安装。
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check, format check, build, tests
+        run: |
+          pnpm typecheck
+          pnpm format:check
+          pnpm test
+
+      - name: Verify the tag matches package.json version
+        env:
+          # 通过 env 传事件字段，避免把可被影响的值直接插进脚本。
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          tag="${TAG_NAME#v}"
+          pkg="$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "标签 v$tag ≠ package.json 里的版本 $pkg"
+            exit 1
+          fi
+          echo "版本一致：$pkg"
+
+      # 产物在空目录里"拷一个文件就能跑"是这条 release 的全部意义，所以先断言它在。
+      - name: Stage the single-file artifact
+        run: |
+          set -e
+          pnpm build
+          test -s dist/bundle/main.js || { echo "缺产物 dist/bundle/main.js"; exit 1; }
+          cp dist/bundle/main.js dsh-remote-relay.mjs
+          sha256sum dsh-remote-relay.mjs > SHA256SUMS
+          ls -l dsh-remote-relay.mjs
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dsh-remote-relay.mjs SHA256SUMS

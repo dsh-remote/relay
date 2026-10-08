@@ -1,0 +1,34 @@
+# 构建上下文裁剪（这一份只作用于 docker build 的 context）。
+#
+# 为什么要裁：中继是零依赖分发（产物是打成一个自包含单文件的 main.js），但仓库根目录
+# 里有 node_modules、构建产物、本地压测数据与四个目录的文档。不裁的后果有两个：构建上下文
+# 白白多传几百 MB（每次 docker build 都要重传，即使命中缓存），以及把不该进镜像的东西带进
+# 构建阶段——压测产物里有状态文件与日志，.git 里可能有不该外传的内容。
+#
+# 两处故意不在列表里：
+# - scripts/：打包那一步（scripts/bundle-relay.mjs）在构建阶段里，要它。
+# - deploy/：Dockerfile 本身用 -f deploy/docker/Dockerfile 指定，**不走 context**，
+#   所以裁掉它不会让 Dockerfile 找不到。
+
+# 依赖与产物：由构建阶段自己装、自己生成，带进去只会覆盖掉刚装好的那份
+node_modules
+dist
+data
+coverage
+
+# 版本控制与 CI 配置
+.git
+.gitignore
+.github
+.vscode
+.idea
+.DS_Store
+
+# 判据与文档：构建产物里一个字节都用不上（发布前的判据在 CI 里跑，不在镜像里）
+tests
+docs
+*.md
+
+# 杂项
+*.log
+logs/
