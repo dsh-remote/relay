@@ -196,6 +196,23 @@ DRC_HOST_TOKEN=smoke-token-0123456789abcdef DRC_PORT=0 node relay.mjs
 curl -s http://127.0.0.1:8787/healthz
 ```
 
+### 4.0 先跑这条诊断（v3 新增）
+
+```sh
+node scripts/relay-doctor.mjs --url http://127.0.0.1:8787
+```
+
+它把上面那张表读一遍，给出**结论 + 下一步动作**，并按需要退出（非 0 = 有要处理的）。
+公网实例把 `--url` 换成 `https://你的域名`（它认 `wss://` 与 `https://`）。
+
+**它绝不打印凭据**：只读一张显式白名单（`pick()`），响应里混进来的其他字段
+——包括将来某天可能加的带凭据字段——一律不出现。这条纪律有判据守着
+（`tests/doctor.test.mjs` 的「只读白名单」那条会用一个**故意混进凭据的假响应**验证）。
+
+> 为什么需要它：这一节下面有二十多个字段，而自建用户遇到问题的第一反应是
+> 「文档里那条命令是哪个来着」。一条诊断命令省掉的是**查文档**这件事，
+> 而查文档恰恰是最容易卡住的一步。
+
 | 字段                 | 类型   | 是否运维契约 | 含义                                                                                                                                                                                                |
 | -------------------- | ------ | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ok`                 | bool   | ✅ **契约**  | `!shuttingDown`。停机中变 `false`                                                                                                                                                                   |
@@ -624,7 +641,31 @@ launchctl load ~/Library/LaunchAgents/com.dsh.remote-control.plist
 
 常驻退化成"一个文件、一条命令、没有依赖安装步骤"。 **[未实测]**
 
-### 8.3 Docker（生产用的就是这一份）
+### 8.3 Windows 服务（v3 新增）
+
+`deploy/windows/drc-relay-install.cmd` 用 [NSSM](https://nssm.cc/) 把单文件产物装成服务：
+
+```cmd
+set DRC_HOST_TOKEN=<与主机插件逐字一致>
+set DRC_STATE_FILE=D:\drc\state.json
+drc-relay-install.cmd install
+```
+
+**为什么需要它**（V3-PLAN §6.3）：v2 只有 systemd 与容器两条路，Windows 上没有配方。
+
+**而 Windows 上有一条 Linux 没有的坑**：服务停止在 Windows 上是**硬杀**——
+Node 收不到 `SIGTERM`，于是排空（`close`）与兜底落盘（`forceShutdown`）一次都不跑。
+v3 为此把停机做成了**可显式调用的出口**（`src/lifecycle.ts`），并让安装脚本把
+`AppStopMethodConsole` 设成"先发 Ctrl+C"：那 15 秒里优雅停机才跑得起来。
+> Linux 上 systemd 的 `KillSignal=SIGTERM` 天生就走到那条路，Windows 要显式配。
+
+依赖 NSSM 是**外部**依赖，不进本仓——它是"Windows 没有内置 service wrapper"的事实所迫
+（systemd 是 Linux 自带的）。
+
+凭据不进命令行历史也不进服务描述：脚本把它写进服务配置（落在注册表，由本机 ACL 守着）。
+**不要**把 hostToken 写进 `deploy/` 下的任何文件或文档示例。 **[未实测]**
+
+### 8.4 Docker（生产用的就是这一份）
 
 仓库里**有** Dockerfile 与 compose：`deploy/docker/`。形态与裸机 systemd **同形**——
 同一个单文件产物、同一套 `DRC_*`、同一个 `/healthz`；变的只有「谁负责把它拉起来」。
