@@ -12,6 +12,7 @@
 import { readFileSync } from 'node:fs'
 import { loadConfig, type ConfigProblem } from './config.js'
 import { createRelay } from './server.js'
+import { createShutdown, registerSignalHandlers } from './lifecycle.js'
 
 /** 打包时由 `scripts/bundle-relay.mjs` 以 esbuild define 注入；未打包时这个标识符不存在。 */
 declare const __DRC_VERSION__: string | undefined
@@ -96,24 +97,10 @@ async function main(): Promise<void> {
   const { port, bind } = await relay.startListening()
   relay.log.info('relay listening', { port, bind, publicUrl: config.publicUrl, version: config.version })
 
-  let closing = false
-  const shutdown = (signal: string): void => {
-    if (closing) return
-    closing = true
-    relay.log.info('shutting down', { signal })
-    const guard = setTimeout(() => {
-      relay.log.warn('shutdown timed out, forcing exit')
-      // 兜底路径也要补写一次盘：排空超时说明还有在途连接，但内存表仍是此刻最新的真相，
-      // 不写就等于把这次停机期间的变更丢掉。`shutdownForced` 同步进 /healthz——
-      // 这条 exit(0) 与"排空成功"同一个码，只有计数能让运维事后分辨。
-      relay.forceShutdown()
-      process.exit(0)
-    }, 5000)
-    guard.unref()
-    void relay.close().then(() => process.exit(0))
-  }
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGINT', () => shutdown('SIGINT'))
+  // 停机出口抽到 `lifecycle.ts`（A3）：Windows 服务停止 = 硬杀，Node 收不到信号投递，
+  // 于是排空与兜底落盘一次都不跑。信号现在只是**触发源之一**。
+  const { shutdown } = createShutdown(relay)
+  registerSignalHandlers((reason) => shutdown(reason))
   process.on('uncaughtException', (error) => {
     relay.log.error('uncaught exception', { message: String(error?.message ?? error) })
     process.exit(1)
