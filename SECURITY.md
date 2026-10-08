@@ -1,48 +1,19 @@
-# 安全政策
+# Security Policy
 
 ## 报告漏洞
 
-请通过 [GitHub Security Advisories](https://github.com/providcc/dsh-remote-server/security/advisories/new)
-（**Security → Report a vulnerability**）私下报告疑似漏洞。
+用本仓 GitHub 的私密渠道：**Security → Report a vulnerability**（`/security/advisories/new`）。
+不要在公开 issue 里贴可利用细节。
 
-安全报告**不要**开公开 issue。我们会在几天内确认，修复发布后会为愿意署名的报告者致谢。
+## 本仓的范围
 
-报告时请尽量包含：
+- 负责：WebSocket 路由与鉴权（`hostToken`）、配对码表（TTL / 一次性 / 限流）、
+  帧分级与体积闸（`ws.maxPayload`）、慢消费者处置、日志的凭据卫生。
+- 不负责：载荷内容——**结构上看不见**；密码学在中继的依赖图上不可达（有产物级判据）。
 
-- 受影响的版本或提交；
-- 最小复现或 PoC；
-- 你认为的影响面（机密性 / 完整性 / 可用性）；
-- 该问题是否同样影响主机插件或小程序客户端——三端实现的是同一份协议。
+## 零知识（可核对的说法）
 
-## 范围
-
-本仓交付**中继服务**。它在主机与已配对客户端之间转发密封记录，持有主机的注册凭据
-（`DRC_HOST_TOKEN`）与配对码路由表，但**没有载荷密钥**。
-
-在范围内：
-
-- 任何让中继读到明文字节或密钥的途径（这应当是结构上不可能的）；
-- 破坏"每条连接的角色与成员表"的途径——例如让客户端冒充主机、或让非成员往某条通道写；
-- 配对码的暴力枚举或重放（6 位码只有 10⁶ 空间）；
-- 认证绕过、越权访问其它会话；
-- 让中继内存无界增长的途径（慢消费者、待配对表、会话表）；
-- 产物层面的回归：构建产物里出现了密码学代码（`tests/bundle.test.mjs` 会断言它不存在）。
-
-不在本仓范围：协议层的密码学正确性（在 `dsh-remote-wire`）、TLS 终止与按 IP 限流
-（由部署方的反向代理负责）、主机插件与小程序客户端的实现。
-
-## 设计姿态
-
-- **结构性零知识。** 中继不是"不去解密"，是**没有可解密的代码**——依赖图上拿不到密钥，
-  构建产物里搜不到 `xsalsa20` / `secretbox` / `tweetnacl`。有测试守着这条。
-- **PSK 从不上网。** 它在主机上生成，只经配对二维码交给手机。中继从未见过它。
-- **配对码一次性、短命、服务端权威。** 6 位、单次使用、TTL 由中继下发。
-- **分层限流。** 全局配对配额（`DRC_PAIR_GLOBAL_PER_SEC`）是唯一的暴力枚举防线；
-  按 IP 的配额由反向代理补上（中继看不到真实客户端 IP）。
-- **没有 `DRC_PAIR_STATUS` 时 `/api/pair-status` 是 404。** 它会成为一个现成的扫描 oracle。
-
-完整威胁模型、冻结契约表与加固清单见 [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md)。
-
-## 支持的版本
-
-中继与协议整体版本化；安全修复只落在最新发布线上。请保持依赖更新（Dependabot 每周提 PR）。
+- 构建产物 `dist/bundle/main.js` 里**没有**任何密码学实现：`tests/bundle.test.mjs`
+  直接读产物，对 `xsalsa20` / `secretbox` / `tweetnacl` 等标记逐条断言。
+- 日志约定：只记 id / 计数 / reason；配对码与 `hostToken` 永不整值落日志（有判据）。
+- 部署加固（TLS 由反代终止、绑定与防火墙、状态/凭据文件权限）见 `docs/SELF-HOSTING.md`。

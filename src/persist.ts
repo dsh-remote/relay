@@ -50,7 +50,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
-import { CONVERSATION_ID_PREFIX } from 'dsh-remote-wire/ids'
+import { CONVERSATION_ID_PREFIX } from '@dsh-remote/protocol/ids'
 import type { Log } from './log.js'
 import type { Conversation, RelayState } from './state.js'
 

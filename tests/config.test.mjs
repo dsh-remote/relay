@@ -12,7 +12,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { loadConfig } from '../dist/src/config.js'
-import { MAX_CIPHERTEXT_BYTES, MAX_RELAY_MESSAGE_BYTES } from 'dsh-remote-wire/frames'
+import { MAX_CIPHERTEXT_BYTES, MAX_RELAY_MESSAGE_BYTES } from '@dsh-remote/protocol/frames'
 
 const TOKEN = 'config-test-token-0123456789abcdef'
 const load = (env = {}) => loadConfig({ DRC_HOST_TOKEN: TOKEN, ...env }, 'test')

@@ -244,7 +244,7 @@ test('错误码 → 文案 → 实际发出的帧，三者一致（钉住"文案
 let _wire
 function wireFrames() {
   if (!_wire)
-    _wire = createRequire(new URL('../dist/src/server.js', import.meta.url).pathname)('dsh-remote-wire/frames')
+    _wire = createRequire(new URL('../dist/src/server.js', import.meta.url).pathname)('@dsh-remote/protocol/frames')
   return _wire
 }
 

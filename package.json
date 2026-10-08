@@ -1,18 +1,18 @@
 {
-  "name": "dsh-remote-server",
+  "name": "@dsh-remote/relay",
   "version": "2.0.21",
   "private": true,
-  "description": "Zero-knowledge WebSocket relay for DSH Remote Control. Routes sealed records between the host plugin and paired clients; never sees plaintext.",
+  "description": "DSH Remote Control 的零知识 WebSocket 中继：只做路由，不碰载荷明文。可自托管的单文件产物。",
   "type": "module",
   "license": "MIT",
-  "author": "providcc",
+  "author": "dsh-remote",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/providcc/dsh-remote-server.git"
+    "url": "git+https://github.com/dsh-remote/dsh-remote-relay.git"
   },
-  "homepage": "https://github.com/providcc/dsh-remote-server#readme",
+  "homepage": "https://github.com/dsh-remote/dsh-remote-relay#readme",
   "bugs": {
-    "url": "https://github.com/providcc/dsh-remote-server/issues"
+    "url": "https://github.com/dsh-remote/dsh-remote-relay/issues"
   },
   "keywords": [
     "dsh",
@@ -38,9 +38,9 @@
   },
   "dependencies": {},
   "devDependencies": {
+    "@dsh-remote/protocol": "workspace:*",
     "@types/node": "^26.6.3",
     "@types/ws": "^8.5.12",
-    "dsh-remote-wire": "2.0.21",
     "esbuild": "^0.28.2",
     "prettier": "^3.3.3",
     "typescript": "^7.0.2",

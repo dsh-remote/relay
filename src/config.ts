@@ -25,7 +25,7 @@
  * 多出一个状态文件，而"配对随中继重启全丢"只发生在长期运行的那一个实例上。
  */
 
-import { MAX_RELAY_MESSAGE_BYTES } from 'dsh-remote-wire/frames'
+import { MAX_RELAY_MESSAGE_BYTES } from '@dsh-remote/protocol/frames'
 import { CLIENT_SLOW_CONSUMER_MS, HOST_SLOW_CONSUMER_MS } from './limits.js'
 
 export interface RelayConfig {
