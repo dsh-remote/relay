@@ -1,0 +1,44 @@
+# 中继的发布：**只挂单文件产物，不发 npm**。
+#
+# 为什么不发：`dsh-remote-server` 这个包名在 npm 上属于另一个无关项目
+# （`MRZHUH/dsh-remote-server`），发上去等于装到别人的东西。v3 起本包名为
+# `@dsh-remote/relay`（见 package.json），但**这一版仍然不发**——发不发是产品决策，
+# 不是改个名字就顺带发生的事。`tests/bundle.test.mjs` 有一条判据钉住它：
+# `private: true`、无 `bin`/`files`、本文件里不许出现 publish 步骤与 id-token。
+#
+# 产物形态：`dist/bundle/main.js` 是**自包含单文件**（ws / zod / 协议层全部内联），
+# 生产部署退化成「scp 一个文件 + systemctl restart」。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: 校验产物与包版本一致
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          grep -q "\"version\":\"$VERSION\"" dist/bundle/main.js \
+            || { echo "产物里没有版本号 $VERSION：先看 scripts/bundle-relay.mjs 的 define"; exit 1; }
+      - name: 建 Release 并挂单文件产物
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/bundle/main.js
