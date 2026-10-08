@@ -17,8 +17,9 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { fileURLToPath } from 'node:url'
 
-const BUNDLE = new URL('../dist/bundle/main.js', import.meta.url).pathname
+const BUNDLE = fileURLToPath(new URL('../dist/bundle/main.js', import.meta.url))
 /** 按包名解析协议包，而不是写死它在工作区里的相对路径——这里是独立仓，只有 node_modules。 */
 const require = createRequire(import.meta.url)
 
@@ -116,7 +117,7 @@ test('协议包声明 sideEffects:false —— 上面那条零知识保证的前
  * 末尾两条与发不发无关，是产物事实：运行时依赖为空、shebang 在第一行。
  */
 test('本仓不发 npm：private 必须为 true，release.yml 里不许出现发包步骤与 id-token', () => {
-  const root = path.join(path.dirname(new URL(import.meta.url).pathname), '..')
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
   const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
   assert.equal(pkg.private, true, 'private 被去掉了：那意味着有人准备发包，但这个名字是别人的')
   assert.equal(pkg.bin, undefined, 'bin 是发包才需要的东西，留着它会让人以为 npm 上装得到')

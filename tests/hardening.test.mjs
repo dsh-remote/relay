@@ -8,6 +8,7 @@
  * 不猜端口、不撞端口，也不依赖本机有空闲的固定端口。
  */
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
@@ -15,7 +16,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
 
 const TOKEN = 'hardening-test-token-0123456789abcdef'
-const MAIN = new URL('../dist/src/main.js', import.meta.url).pathname
+const MAIN = fileURLToPath(new URL('../dist/src/main.js', import.meta.url))
 
 /** 启动中继子进程，等到它把真实端口写进启动日志。 */
 async function boot(env = {}) {

@@ -360,6 +360,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
     bad_frame: '有一帧数据不合法，已丢弃',
     bad_json: '收到无法解析的数据，已丢弃',
     unknown_frame: '对端版本不认识这个帧',
+    // 补差量落在保留窗口之外（规范 §10.7 S4）。文案要说清**发生了什么 + 该做什么**：
+    // 只说"取不到历史"的话，用户会去点"加载更早"（那是另一个方向），而正确动作是
+    // 由客户端改拉历史——那句提示是给客户端看的，而它最终会被转述成人话。
+    history_window_exceeded: '断线时间太长，中间那段已经补不回来了，正在重新拉取',
     pair_table_full: '配对表已满，请稍后再试',
     need_client: '需要先从手机侧发起配对',
     unsupported_protocol: '中继与手机的协议版本不兼容，请把小程序升级到最新版',
