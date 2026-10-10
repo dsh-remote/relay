@@ -37,18 +37,4 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm format:check
-      # ⚠️ **临时诊断**（2026-10-10）：本机连不上 `github.com`，job 日志端点抓不到，
-      # 而 check-run annotations 是小 payload、能读到的 ⇒ 把失败的用例名变成 annotation。
-      - name: test
-        shell: bash
-        run: |
-          set -o pipefail
-          pnpm test 2>&1 | tee test-output.log
-      - if: failure()
-        shell: bash
-        run: |
-          # 只给用例名不够定位 —— 把**断言错误本身**也带出来
-          grep -aA 14 "^not ok" test-output.log \
-            | grep -aE "^not ok|error: |actual|expected|^\s+[+-] " \
-            | head -70 | sed 's/^/::error::/' || true
-          echo "::error::—— 失败用例共 $(grep -acE '^not ok' test-output.log) 条 ——"
+      - run: pnpm test
