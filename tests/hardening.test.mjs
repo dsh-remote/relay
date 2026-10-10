@@ -15,6 +15,7 @@ import { spawn } from 'node:child_process'
 import net from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
+import { skipUnlessSignals } from './test-platform.mjs'
 
 const TOKEN = 'hardening-test-token-0123456789abcdef'
 const MAIN = fileURLToPath(new URL('../dist/src/main.js', import.meta.url))
@@ -128,7 +129,10 @@ test('坏配置直接失败：端口越界与未知日志级别', async () => {
   }
 })
 
-test('SIGTERM：对端收到 1001，进程 exit 0（systemd 的 TimeoutStopSec 依赖这个语义）', async () => {
+// ⚠️ 这条判据的前提就是「信号会被投递」：win32 上 SIGTERM 被映射成 TerminateProcess，
+//    对端收到的是 **1006**（异常关闭）而不是 1001（going away）。
+//    Windows 上的对应事实由 lifecycle 的「win32：信号不投递，所以必须有不依赖信号的出口」守。
+test('SIGTERM：对端收到 1001，进程 exit 0（systemd 的 TimeoutStopSec 依赖这个语义）', skipUnlessSignals(), async () => {
   const server = await boot()
   try {
     const peer = connect(server.url)

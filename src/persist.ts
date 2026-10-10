@@ -269,7 +269,29 @@ export function restoreState(path: string, state: RelayState, log: Log, now: num
 function syncPath(target: string, log: Log, strict = true): void {
   let fd: number | undefined
   try {
-    fd = openSync(target, 'r')
+    /**
+     * ⚠️ **优先 `'r+'`，拿不到才退 `'r'`**（2026-10-10 修的真缺陷）。
+     *
+     * ## 为什么（这是一个"Windows 上落盘整个失效"的缺陷）
+     *
+     * Windows 上 `fsync` 走的是 `FlushFileBuffers`，而它**要求句柄有写权限**；
+     * 只读句柄会失败。POSIX 上只读 fsync 是允许的，所以这个写法在 macOS / Linux
+     * 上一路正常 —— 直到四个开源仓的 CI **第一次真的在 `windows-latest` 上跑起来**。
+     *
+     * 后果不是"少一次 fsync"：`strict=true`（文件那一次）会**抛**，外层 catch
+     * 于是 unlink 掉临时文件并 `return false` —— 而 `renameSync` 在 `syncPath` **之后**，
+     * 所以 **`state.json` 根本不会被创建**。表现是 `ENOENT`，看起来像"路径配错了"，
+     * 其实是"落盘这一步在 Windows 上从来没成功过"（7 条验收判据同时红）。
+     *
+     * ⇒ 目录那一次 `'r+'` 本来就打不开（目录不能按读写打开），自然退到 `'r'`，
+     *   与原来一样是 best-effort（`strict=false`）；文件那一次拿到写权限，
+     *   Windows 上才真的能 fsync。
+     */
+    try {
+      fd = openSync(target, 'r+')
+    } catch {
+      fd = openSync(target, 'r')
+    }
     fsyncSync(fd)
   } catch (e) {
     // strict（文件本身）时抛出 → 外层 catch 记 warn 并计一次 stateWriteFailures，

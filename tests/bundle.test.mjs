@@ -19,6 +19,7 @@ import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { skipUnlessSignals } from './test-platform.mjs'
 
 const BUNDLE = fileURLToPath(new URL('../dist/bundle/main.js', import.meta.url))
 /** 按包名解析协议包，而不是写死它在工作区里的相对路径——这里是独立仓，只有 node_modules。 */
@@ -37,7 +38,9 @@ test('产物里没有任何密码学实现（零知识在依赖图上成立）',
   assert.ok(kb < 3_000, `产物 ${kb} KB，超出预期`)
 })
 
-test('单文件在没有 node_modules 的空目录里能启动、应答健康检查并优雅退出', async () => {
+// ⚠️ 「优雅退出」靠 SIGTERM —— win32 上它是 TerminateProcess，进程没有机会优雅停机。
+//    （relay 的非信号出口本身另有判据：lifecycle 的「win32：信号不投递」那条。）
+test('单文件在没有 node_modules 的空目录里能启动、应答健康检查并优雅退出', skipUnlessSignals(), async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'drc-relay-'))
   const target = path.join(dir, 'relay.mjs')
   copyFileSync(BUNDLE, target)

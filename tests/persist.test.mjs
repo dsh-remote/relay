@@ -26,6 +26,7 @@ import { loadConfig } from '../dist/src/config.js'
 import { Log } from '../dist/src/log.js'
 import { RelayState, WS_OPEN } from '../dist/src/state.js'
 import { STATE_FILE_VERSION, readStateFile, restoreState, snapshotState, writeStateFile } from '../dist/src/persist.js'
+import { skipUnlessPosix } from './test-platform.mjs'
 
 const TOKEN = 'unit-test-host-token-0123456789abcdef'
 const CIPHER = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
@@ -422,7 +423,8 @@ test('验收 5b：空会话回收同样同步删盘（走清扫那条路）', as
 
 // ── 单测：写盘与恢复的边界 ─────────────────────────────────────────────
 
-test('临时文件残留 / pid 复用：最终状态文件仍是 0600（mode 只在创建那一刻生效）', () => {
+// ⚠️ 纯 POSIX 权限位判据：win32 上 `chmod` 只切只读位、`statSync().mode & 0o777` 无意义。
+test('临时文件残留 / pid 复用：最终状态文件仍是 0600（mode 只在创建那一刻生效）', skipUnlessPosix(), () => {
   const dir = tmpDir()
   try {
     const p = join(dir, 'state.json')
