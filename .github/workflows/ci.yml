@@ -47,5 +47,8 @@ jobs:
       - if: failure()
         shell: bash
         run: |
-          grep -aE "^not ok|test timed out|timed out" test-output.log | head -40 | sed 's/^/::error::/' || true
+          # 只给用例名不够定位 —— 把**断言错误本身**也带出来
+          grep -aA 14 "^not ok" test-output.log \
+            | grep -aE "^not ok|error: |actual|expected|^\s+[+-] " \
+            | head -70 | sed 's/^/::error::/' || true
           echo "::error::—— 失败用例共 $(grep -acE '^not ok' test-output.log) 条 ——"
