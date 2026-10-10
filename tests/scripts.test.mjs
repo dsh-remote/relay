@@ -21,7 +21,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync,
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const RELAY_START = join(ROOT, 'scripts', 'relay-start.mjs')
@@ -59,7 +59,11 @@ test('relay-start.mjs：默认日志级别是 info —— debug 级会把完整�
 test('readHostToken：patch 文件里的 hostToken 各种写法都能取到（v2 用 grep -oE 拼的）', async () => {
   // 动态 import 拿纯函数出来测。v2 那条 `grep -oE | head -1 | sed -E` 没法被单测直接调，
   // 换 .mjs 之后它就是一段纯函数，**每个形态都能逐格验**。
-  const { readHostToken } = await import(RELAY_START)
+  // ⚠️ 动态 `import()` 收的是 **URL**，不是文件系统路径。
+  //    在 Windows 上传裸路径（`D:\a\relay\relay\scripts\...`）会被当成 scheme 为 `d:` 的 URL，
+  //    报 `Only URLs with a scheme in: file, data, and node are supported`。
+  //    这是 test-platform 那张表里「URL 取路径」那一类的**反向**形态（那边是把 URL 当路径用）。
+  const { readHostToken } = await import(pathToFileURL(RELAY_START).href)
   for (const [yaml, want] of [
     ['plugins:\n  hostToken: abc123\n', 'abc123'],
     ['hostToken: "quoted-token"\n', 'quoted-token'],
