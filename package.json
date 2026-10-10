@@ -1,18 +1,17 @@
 {
   "name": "@dsh-remote/relay",
   "version": "3.0.8",
-  "private": true,
   "description": "DSH Remote Control 的零知识 WebSocket 中继：只做路由，不碰载荷明文。可自托管的单文件产物。",
   "type": "module",
   "license": "MIT",
   "author": "dsh-remote",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dsh-remote/dsh-remote-relay.git"
+    "url": "git+https://github.com/dsh-remote/relay.git"
   },
-  "homepage": "https://github.com/dsh-remote/dsh-remote-relay#readme",
+  "homepage": "https://github.com/dsh-remote/relay#readme",
   "bugs": {
-    "url": "https://github.com/dsh-remote/dsh-remote-relay/issues"
+    "url": "https://github.com/dsh-remote/relay/issues"
   },
   "keywords": [
     "dsh",
@@ -26,7 +25,7 @@
   "engines": {
     "node": ">=20"
   },
-  "main": "./dist/src/main.js",
+  "main": "./dist/bundle/main.js",
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
     "build": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs",
@@ -46,5 +45,17 @@
     "typescript": "^7.0.2",
     "ws": "^8.18.0"
   },
-  "packageManager": "pnpm@11.7.0"
+  "packageManager": "pnpm@11.7.0",
+  "bin": {
+    "dsh-remote-relay": "./dist/bundle/main.js"
+  },
+  "files": [
+    "dist/bundle",
+    "deploy",
+    "SECURITY.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }

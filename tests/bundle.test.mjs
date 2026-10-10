@@ -115,22 +115,92 @@ test('协议包声明 sideEffects:false —— 上面那条零知识保证的前
 })
 
 /**
- * 分发决策的闸门：**本仓不发 npm**。原因很硬——`dsh-remote-server` 这个包名在 npm 上属于
- * 另一个无关项目（`bondzhu` / `MRZHUH/dsh-remote-server`，一个"在 DSH 会话里 @ 服务器走 SSH
- * 执行命令"的工具），2026-10-03 用户拍板"先不发"。
- * 这里钉的是**别半发**：半发的形状是 package.json 去掉了 private、release.yml 里多了一步
- * publish，而包名撞墙——结局要么红在 CI，要么更糟：装到别人的东西。
+ * 分发形状的闸门：**本仓从 2026-10-10 起发 npm**（走 Trusted Publishing / OIDC）。
+ *
+ * ## 为什么改过（原判据钉的是相反的事）
+ *
+ * 原来这条钉 `private: true`、不许出现发包步骤与 `id-token`。它给的理由是
+ * **包名撞墙**：`dsh-remote-server` 在 npm 上属于另一个无关项目
+ * （`bondzhu` / `MRZHUH/dsh-remote-server`，一个"在 DSH 会话里 @ 服务器走 SSH 执行命令"的工具），
+ * 2026-10-03 用户拍板"先不发"。
+ *
+ * ⚠️ **那条理由到 2026-10-10 已经不成立了**：包名早就从 `dsh-remote-server` 改成了
+ * **带 scope 的 `@dsh-remote/relay`**，而它在 npm 上是 **404（没被占）**。
+ * 撞的是**旧名字**，不是现在这个名字。用户 2026-10-10 拍板"发"。
+ *
+ * ## 但它防的东西仍然值得防 —— 所以是**改写**，不是删掉
+ *
+ * 原判据真正有价值的部分是"**别半发**"：那种形状是"package.json 去掉了 private、
+ * workflow 里加了 publish，但别的没跟上"，结局要么红在 CI，要么更糟。
+ * 现在"半发"的新形状是：**该发的没进白名单**（源码/测试被打进包里）、
+ * **该不发的那条 workflow 混进了发布步骤**、或者**发布权限给了不该有的 job**。
+ * 下面逐条钉这些。
+ *
  * 末尾两条与发不发无关，是产物事实：运行时依赖为空、shebang 在第一行。
  */
-test('本仓不发 npm：private 必须为 true，release.yml 里不许出现发包步骤与 id-token', () => {
+test('分发形状：发 npm 的包该有什么、两条 workflow 各自不许越界', () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..')
   const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
-  assert.equal(pkg.private, true, 'private 被去掉了：那意味着有人准备发包，但这个名字是别人的')
-  assert.equal(pkg.bin, undefined, 'bin 是发包才需要的东西，留着它会让人以为 npm 上装得到')
-  assert.equal(pkg.files, undefined, 'files 白名单同理：它只会诱导别人去 npm pack 一个私有包')
-  const workflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8')
-  assert.doesNotMatch(workflow, /(npm|pnpm)\s+(publish|pack)\b/, 'release.yml 里出现了发包步骤，而本仓不发 npm')
-  assert.doesNotMatch(workflow, /id-token: write/, 'id-token 只为 OIDC provenance 存在；不发 npm 就不该申请这个权限')
+
+  // ── 发：私有位必须摘掉，且要声明它是公开的、带 provenance ──
+  assert.equal(pkg.private, undefined, 'private 还在：那 npm 会拒绝发布')
+  assert.equal(pkg.publishConfig?.access, 'public', 'scoped 包不带 access:public 会被当成私有，发布直接失败')
+  assert.equal(pkg.publishConfig?.provenance, true, 'provenance 必须开：这正是接 Trusted Publishing 的目的')
+  assert.equal(
+    pkg.publishConfig?._whyNoProvenance,
+    undefined,
+    '这个字段是"当初为什么没有 provenance"的记录；现在有了，留着它就是一句假话',
+  )
+
+  // ── 发什么：白名单必须存在，且**不许**把源码/测试/CI 一起打进去 ──
+  assert.ok(Array.isArray(pkg.files) && pkg.files.length > 0, 'files 白名单没了：npm 会把整棵树打进包里')
+  assert.ok(pkg.files.includes('dist/bundle'), '产物 dist/bundle 必须进白名单，否则包里没有能跑的东西')
+  for (const forbidden of ['src', 'tests', 'scripts', '.github']) {
+    assert.ok(!pkg.files.includes(forbidden), `files 里出现了 ${forbidden}：那是源码/测试/CI，不是分发物`)
+  }
+  // 入口与 bin 都要指向**自包含单文件产物**，而不是 tsc 出来的那棵树（后者不在白名单里）
+  assert.equal(pkg.main, './dist/bundle/main.js', 'main 要指向单文件产物；指向 dist/src 会指到白名单外')
+  assert.equal(
+    pkg.bin?.['dsh-remote-relay'],
+    './dist/bundle/main.js',
+    'bin 要指向单文件产物，`npx @dsh-remote/relay` 才起得来',
+  )
+
+  // ── 两条 workflow 的分工：发布权限**只许**在 publish.yml 里 ──
+  const release = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8')
+  assert.doesNotMatch(
+    release,
+    /(npm|pnpm)\s+(publish|pack)\b/,
+    'release.yml 是挂 GitHub Release 产物的那条路，不该出现发包步骤',
+  )
+  assert.doesNotMatch(
+    release,
+    /id-token:\s*write/,
+    'release.yml 只挂产物，不需要 OIDC；给了它等于把"能发版"的权限也给了那条路',
+  )
+  /**
+   * ⚠️ **必须剥注释再匹配**（今天第三次栽在这上面）。
+   *
+   * `publish.yml` 的注释里**成段地**讨论 `node-version-file: .nvmrc`（那是在解释
+   * "为什么**不**用它"）⇒ 不剥的话，那条 `doesNotMatch` 会命中注释里的字面量，
+   * 判据**永远红**，而它拦的是一个并不存在的写法。
+   *
+   * 同族先例：本仓 2026-10-08 那次"判据扫源码必须先剥注释"（同一族绊倒四次），
+   * 以及 2026-10-10 那条 `onClientRejoined` 接线判据（注释里提到 `replayPending`，
+   * 不剥的话把调用删掉判据照样绿 —— 那个方向更危险）。
+   */
+  const stripComments = (text) => text.replace(/^\s*#.*$/gm, '')
+  const publish = stripComments(readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8'))
+  assert.match(publish, /id-token:\s*write/, 'publish.yml 少了 id-token: write —— 没有它换不到发布 token')
+  assert.match(publish, /npm publish/, 'publish.yml 里没有 npm publish')
+  assert.doesNotMatch(
+    publish,
+    /node-version-file:\s*\.nvmrc/,
+    'publish.yml 用了 .nvmrc（22）—— 而 Node 22 带 npm 10.9.x，不支持 OIDC 换发布 token。必须显式用 Node 24',
+  )
+  assert.match(publish, /node-version:\s*'?24'?/, 'publish.yml 要显式用 Node 24（它带 npm 11+）')
+
+  // ── 产物事实（与发不发无关，一直成立） ──
   assert.deepEqual(
     pkg.dependencies,
     {},
