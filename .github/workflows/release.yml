@@ -128,12 +128,26 @@ jobs:
           echo "  npm trust github @dsh-remote/relay --repo dsh-remote/relay --file release.yml --allow-publish"
           exit 1
 
-      # 校验产物里真的带着这次要发的版本号（打包脚本的 define 写错时，这里能看出来）。
-      - name: 校验产物里带着版本号
+      # ⚠️ 这里**真跑一次产物**读它自报的版本号，而不是去 grep 文件。
+      #
+      # 为什么：版本号是 esbuild 的 **define 常量** `__DRC_VERSION__` 注入的，
+      # 产物里**根本没有** `"version":"X"` 这种字段 ⇒ 早先那版判据（grep 那个字面量）**恒红**。
+      # 它在 relay 仓第一次真的打 tag 之前一直没暴露 —— **2026-10-10 发 3.1.0 才炸**
+      # （npm 发布与溯源那两步都过了，挂在建 Release 之前，Release 因此没建成）。
+      #
+      # `main.ts` 本来就有 `--version`：`docker run … --version` 是"最省事也最不会出错"的口径
+      # —— 它不监听端口（见 `src/main.ts:50`）。用它顺带把「define 压根没生效」也验掉了：
+      # 那种情况下 `--version` 会报 `0.0.0` 或拿不到值，而不是变成另一个假绿。
+      - name: 产物自报的版本号必须与 package.json 一致
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          grep -q "\"version\":\"$VERSION\"" dist/bundle/main.js \
-            || { echo "::error::产物里没有版本号 $VERSION：先看 scripts/bundle-relay.mjs 的 define"; exit 1; }
+          set -e
+          want="$(node -p "require('./package.json').version")"
+          got="$(node dist/bundle/main.js --version)"
+          echo "产物自报 $got / package.json $want"
+          [ "$got" = "$want" ] || {
+            echo "::error::产物自报 $got，与 package.json 的 $want 不一致：先看 scripts/bundle-relay.mjs 的 define"
+            exit 1
+          }
 
       - name: 建 GitHub Release 并挂上单文件产物
         env:
