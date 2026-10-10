@@ -166,39 +166,32 @@ test('分发形状：发 npm 的包该有什么、两条 workflow 各自不许�
     'bin 要指向单文件产物，`npx @dsh-remote/relay` 才起得来',
   )
 
-  // ── 两条 workflow 的分工：发布权限**只许**在 publish.yml 里 ──
-  const release = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8')
-  assert.doesNotMatch(
-    release,
-    /(npm|pnpm)\s+(publish|pack)\b/,
-    'release.yml 是挂 GitHub Release 产物的那条路，不该出现发包步骤',
-  )
-  assert.doesNotMatch(
-    release,
-    /id-token:\s*write/,
-    'release.yml 只挂产物，不需要 OIDC；给了它等于把"能发版"的权限也给了那条路',
-  )
   /**
-   * ⚠️ **必须剥注释再匹配**（今天第三次栽在这上面）。
+   * ── 发布 workflow 的形状（本仓只有一条 `release.yml`，它同时管发布与产物） ──
    *
-   * `publish.yml` 的注释里**成段地**讨论 `node-version-file: .nvmrc`（那是在解释
-   * "为什么**不**用它"）⇒ 不剥的话，那条 `doesNotMatch` 会命中注释里的字面量，
-   * 判据**永远红**，而它拦的是一个并不存在的写法。
-   *
-   * 同族先例：本仓 2026-10-08 那次"判据扫源码必须先剥注释"（同一族绊倒四次），
-   * 以及 2026-10-10 那条 `onClientRejoined` 接线判据（注释里提到 `replayPending`，
-   * 不剥的话把调用删掉判据照样绿 —— 那个方向更危险）。
+   * ⚠️ **必须剥注释再匹配**（今天第三次栽在这上面）。`release.yml` 的注释里**成段地**
+   * 讨论 `NODE_AUTH_TOKEN` / `pnpm publish`（那是在解释"为什么必须这么写"）⇒ 不剥的话，
+   * 下面那些 `match` 会命中注释里的字面量，**把调用删掉判据照样绿**（这个方向比"永远红"更危险）。
    */
   const stripComments = (text) => text.replace(/^\s*#.*$/gm, '')
-  const publish = stripComments(readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8'))
-  assert.match(publish, /id-token:\s*write/, 'publish.yml 少了 id-token: write —— 没有它换不到发布 token')
-  assert.match(publish, /npm publish/, 'publish.yml 里没有 npm publish')
-  assert.doesNotMatch(
-    publish,
-    /node-version-file:\s*\.nvmrc/,
-    'publish.yml 用了 .nvmrc（22）—— 而 Node 22 带 npm 10.9.x，不支持 OIDC 换发布 token。必须显式用 Node 24',
+  const release = stripComments(readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8'))
+
+  assert.match(release, /id-token:\s*write/, 'release.yml 少了 id-token: write —— 没有它换不到发布 token')
+  assert.match(release, /pnpm publish/, 'release.yml 里没有发包步骤')
+  // 走的是 pnpm 的 OIDC 交换 ⇒ 与 npm CLI 版本无关，所以这里**允许** .nvmrc。
+  // （若改成 `npm publish`，Node 22 带的 npm 10.9.x 不支持 OIDC，那时必须换 Node 24。）
+  assert.match(
+    release,
+    /NODE_AUTH_TOKEN:\s*''/,
+    'NODE_AUTH_TOKEN 没有被显式清空：setup-node 会把它写进 .npmrc，pnpm 在 OIDC 失败时会**静默回落成 token 发布** —— 版本发出去、工作流绿、attestation 一个没有',
   )
-  assert.match(publish, /node-version:\s*'?24'?/, 'publish.yml 要显式用 Node 24（它带 npm 11+）')
+  assert.match(release, /已经在注册表里/, '发布步骤不是幂等的：版本已存在时会 403，把后面的 GitHub Release 一起带走')
+  assert.match(
+    release,
+    /attestations/,
+    'release.yml 没有独立校验 provenance —— 工作流绿不等于带 attestation（见上面那条回落）',
+  )
+  assert.match(release, /dist\/bundle\/main\.js/, 'release.yml 没把单文件产物挂到 Release 上')
 
   // ── 产物事实（与发不发无关，一直成立） ──
   assert.deepEqual(
