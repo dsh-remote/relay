@@ -14,6 +14,7 @@
  * 判据形态刻意选**外部可观测的事实**（进程活不活、日志里有几行、文件里写了什么），
  * 而不是「源码里有没有某个字符串」——后者在变异验证时最容易自己骗自己。
  */
+import { stopChild } from './child-harness.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -172,7 +173,10 @@ test('A1：被拒的连接（超出 DRC_MAX_CONNS）再发畸形帧 —— 进�
     assert.equal(health.ok, true, '进程活着就该继续应答 /healthz')
   } finally {
     for (const ws of sockets) ws.terminate()
-    if (child.exitCode === null) child.kill('SIGTERM')
+    // 收场走共用装置（2026-10-08）：原来这里是"发一个 SIGTERM 就不管了"——
+    // 不等它退出，于是子进程可能在断言已经过去之后还活着；而 SIGTERM 之后
+    // 若它不走优雅停机（卡在系统调用里），这里就永远差一个 reap。
+    await stopChild(child)
   }
 })
 

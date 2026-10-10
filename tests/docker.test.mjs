@@ -89,14 +89,115 @@ test('Dockerfile：STOPSIGNAL 与 ENTRYPOINT 的形状', () => {
   )
 })
 
+test('Dockerfile 按 **v3 单仓布局**拷文件（这条判据是为了钉住 2026-10-08 那个真实故障）', () => {
+  // v2 时这个仓独立，build 上下文就是本仓根 ⇒ `COPY package.json …` 拷的是"本包"。
+  // v3 变 monorepo 后，同一行拷的是 **monorepo 根**的 package.json —— 而根清单里
+  // 没有 relay 的依赖，于是 pnpm 报的错是「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」
+  // 这类**看起来毫不相关**的 mismatch（真实原因：那份清单不是这个包的）。
+  //
+  // 症状：`docker compose build` 失败，而本机 `pnpm install` 完全正常。
+  // 所以这里逐条钉住"上下文是单仓根"这件事由 Dockerfile 自己保证。
+  assert.match(
+    DOCKERFILE,
+    /^COPY packages\/relay\/package\.json /m,
+    '必须显式拷 packages/relay/package.json：只拷根 package.json 会让 pnpm 拿错清单',
+  )
+  assert.match(
+    DOCKERFILE,
+    /^COPY packages\/protocol\/package\.json /m,
+    'protocol 的清单也要拷：relay 依赖它（哪怕走 npm 版本，workspace 里也得在场）',
+  )
+  assert.match(
+    DOCKERFILE,
+    /^COPY packages\/relay\/src \.\/packages\/relay\/src$/m,
+    '源码要拷进 packages/relay/ —— 它的 tsconfig 与 bundle 脚本都以包根为基准',
+  )
+  // 构建工作目录必须落在 relay 包里，否则 pnpm build 会在 monorepo 根跑
+  assert.match(
+    DOCKERFILE,
+    /WORKDIR \/src\/packages\/relay[\s\S]{0,200}?RUN pnpm build/,
+    '构建前必须 WORKDIR 到 packages/relay：在根目录跑 pnpm build 不会产出这个包的 bundle',
+  )
+  // 产物拷贝路径要与上面那处WORKDIR 一致（改一处忘另一处 = 镜像里没有 /app/relay.mjs）
+  assert.match(
+    DOCKERFILE,
+    /^COPY --from=build \/src\/packages\/relay\/dist\/bundle\/main\.js /m,
+    '产物路径要带 packages/relay/ 前缀：与 WORKDIR 一致，否则这一步在镜像构建末尾才失败',
+  )
+  // 反向：旧的单包写法不许残留（它是这次故障的根因）
+  assert.doesNotMatch(
+    DOCKERFILE,
+    /^COPY package\.json pnpm-lock\.yaml pnpm-workspace\.yaml \.\/$/m,
+    '单包时代的 COPY 写法不许残留：它在单仓里会拷到根清单而不是本包的',
+  )
+})
+
+test('Dockerfile：COPY 只取镜像真正要的那几个文件，且 protocol 的源码在 install 之前', () => {
+  // ## 镜像只需要 protocol + relay 两个包
+  //
+  // 我一度以为"pnpm-workspace.yaml 声明的包必须清单齐备"，为此加了 plugin/client/e2e
+  // 三条 COPY，并用一条判据把它固化。**那三条无效**：删掉之后
+  // `pnpm install --frozen-lockfile` 照样通过（2026-10-08 在生产服务器上实测：
+  // 只放 protocol + relay 两份清单，frozen 检查顺利过，只在下一步因缺 protocol 的
+  // tsconfig 而失败）。pnpm 只校验**它要解析的那些 importer**。
+  //
+  // 而那次「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」的 mismatch 真相不是"清单没拷全"，
+  // 而是**根 package.json 被覆盖**：上传源码时用 `tar xzf`，relay 的 package.json
+  // 覆盖到了仓库根 ⇒ pnpm 拿 relay 的依赖去比根的 lock ⇒ 报出 relay 的依赖名。
+  // **报错指错地方时，先怀疑"文件被覆盖"，别急着加 COPY。**
+  assert.match(DOCKERFILE, /^COPY packages\/relay\/package\.json /m, '必须拷 relay 的清单（它才是这个镜像的包）')
+  assert.match(DOCKERFILE, /^COPY packages\/protocol\/package\.json /m, 'protocol 是 relay 的依赖，清单必须在场')
+  assert.doesNotMatch(
+    DOCKERFILE,
+    /^COPY packages\/(plugin|client)\/package\.json /m,
+    '镜像不需要 plugin / client 的清单：加上无效（实测过），只会让构建上下文里出现用不到的东西',
+  )
+
+  // protocol 的 `prepare` 是 install 生命周期的一环 ⇒ 它的源码必须在 install 之前
+  // ⚠️ 只认**行首是指令**的那一行：用 `indexOf` 会命中注释里提到的那句话
+  // （本文件注释里正好写了 "pnpm install 只软链它的 package.json"，位置还更靠后）。
+  const lineOf = (re) => DOCKERFILE.split('\n').findIndex((line) => re.test(line))
+  const installAt = lineOf(/^RUN\s+corepack enable && pnpm install/)
+  const protoSrcAt = lineOf(/^COPY packages\/protocol\/src/)
+  assert.ok(installAt >= 0, '找不到 pnpm install 那一步')
+  assert.ok(protoSrcAt >= 0 && protoSrcAt < installAt, 'protocol 的 src+tsconfig 必须在 install **之前** COPY')
+  assert.match(
+    DOCKERFILE,
+    /COPY packages\/protocol\/tsconfig\.json \.\/packages\/protocol\//,
+    'protocol 的 tsconfig 也要在 install 之前：它的 prepare 会 tsc，缺文件报 TS5058',
+  )
+
+  // 镜像构建要用的两个目录
+  for (const dir of ['packages/relay/src', 'packages/relay/scripts']) {
+    assert.ok(DOCKERFILE.includes(`COPY ${dir} `), `缺 ${dir}：bundle 脚本在构建阶段要用`)
+  }
+})
+
+test('COPY 行不许带行尾注释（Dockerfile 会把 # 之后的内容当成拷贝路径）', () => {
+  // 2026-10-08 栽过：`COPY package.json ./   # monorepo 根清单`
+  // ⇒ 报错形态是 `"/需要它来解": not found`——一个**看起来像文件名**的中文片段。
+  // ⚠️ **逐行判定**，不用 `/^COPY.*#.*$/m`：那条正则里的 \s 会吃掉换行，
+  // 于是它把「COPY 行 + 下一行注释」当成一行（2026-10-08 实测：匹配到 5 行全是误报）。
+  // 这正是「判据自己也会骗人」的一例——症状同样是"判据红了但实现是对的"。
+  const offenders = DOCKERFILE.split('\n')
+    .map((line, i) => ({ line: i + 1, text: line }))
+    .filter(({ text }) => /^\s*COPY\s/.test(text) && text.includes('#'))
+    .map(({ line, text }) => `第 ${line} 行：${text.trim()}`)
+  assert.deepEqual(offenders, [], `这些 COPY 行的行尾带注释：${offenders.join(' / ')}\n要说明就写在上一行`)
+})
+
 test('compose：端口只发布到宿主机回环（nginx 一行都不用改的前提）', () => {
+  // ⚠️ 引号写成 `["']`：这些断言要验的是**值**，不是 YAML 的引号风格。
+  // v3 跑了一次 `pnpm format` 之后 compose 里的 `"` 被 prettier 换成 `'`，
+  // 于是三条判据一起红——而部署语义一个字都没变。
+  // 「判据红了先怀疑判据」在这里的结论仍然是：判据更脆（它把风格当成了语义）。
   assert.match(
     COMPOSE,
-    /- "127\.0\.0\.1:\$\{DRC_PORT(?::-\d+)?\}:\$\{DRC_PORT(?::-\d+)?\}"/,
+    /- ["']127\.0\.0\.1:\$\{DRC_PORT(?::-\d+)?\}:\$\{DRC_PORT(?::-\d+)?\}["']/,
     '必须是 127.0.0.1:PORT:PORT：绑 0.0.0.0 会把 8787 直接暴露公网、绕过 nginx 的按 IP 限流',
   )
-  assert.doesNotMatch(COMPOSE, /- "0\.0\.0\.0:/, '不许发布到 0.0.0.0')
-  assert.match(COMPOSE, /DRC_BIND: "0\.0\.0\.0"/, '容器内必须绑 0.0.0.0，否则发布了没人监听')
+  assert.doesNotMatch(COMPOSE, /- ["']0\.0\.0\.0:/, '不许发布到 0.0.0.0')
+  assert.match(COMPOSE, /DRC_BIND: ["']0\.0\.0\.0["']/, '容器内必须绑 0.0.0.0，否则发布了没人监听')
 })
 
 test('compose：落盘路径与卷是一对，且默认用具名卷', () => {
@@ -119,7 +220,7 @@ test('compose：加固项与 systemd 单元取同一个口径', () => {
     [/no-new-privileges:true/, '不需要提权'],
     [/^\s*mem_limit: 512m$/m, '与单元里的 MemoryMax=512M 同一个数'],
     [/^\s*stop_grace_period: 15s$/m, '必须大于程序内部 5 秒兜底，否则 compose 先 SIGKILL，最后一次补写被砍掉'],
-    [/max-size: "10m"/, '日志行数无界，不轮转会把磁盘吃满'],
+    [/max-size: ["']10m["']/, '日志行数无界，不轮转会把磁盘吃满'],
   ]) {
     assert.match(COMPOSE, pattern, `compose 缺 ${pattern} —— ${why}`)
   }
@@ -229,7 +330,9 @@ test('指南：从 systemd 切过来时，属主改在停服务之后（顺序�
 
 test('docker compose config 在装了 compose 的机器上真的成立（没装就跳过，不假装通过）', async (t) => {
   const { spawnSync } = await import('node:child_process')
-  const probe = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8' })
+  // timeout：docker CLI 在 daemon 不起时可能长时间挂住；没有上限的话
+  // 一条判据就能把整套 relay 测试钉死（2026-10-08 加，见 e2e/child-harness-guard ④）。
+  const probe = spawnSync('docker', ['compose', 'version'], { encoding: 'utf8', timeout: 20_000 })
   if (probe.status !== 0) {
     t.skip('这台机器上没有 docker compose')
     return
@@ -238,6 +341,7 @@ test('docker compose config 在装了 compose 的机器上真的成立（没装�
     cwd: ROOT,
     encoding: 'utf8',
     env: { ...process.env, DRC_HOST_TOKEN: 'docker-test-dummy-token-0123456789' },
+    timeout: 30_000,
   })
   assert.equal(res.status, 0, `compose config 失败：${res.stderr}`)
   // 反过来：不给 token 必须失败，且错误信息要指名去哪里设。
@@ -245,6 +349,7 @@ test('docker compose config 在装了 compose 的机器上真的成立（没装�
     cwd: ROOT,
     encoding: 'utf8',
     env: { ...process.env, DRC_HOST_TOKEN: '' },
+    timeout: 30_000,
   })
   assert.notEqual(missing.status, 0, '缺 DRC_HOST_TOKEN 时 compose config 就该失败')
   assert.match(missing.stderr + missing.stdout, /DRC_HOST_TOKEN/, '失败信息要指名是哪个变量')

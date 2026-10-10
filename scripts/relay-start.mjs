@@ -36,7 +36,9 @@ const ROOT = path.join(HERE, '..')
 const PROFILE = process.env.DSH_PROFILE ?? path.join(os.homedir(), '.dsh', 'profiles', 'desktop')
 const PATCH_FILE = path.join(PROFILE, 'cordis.patch.yml')
 const PORT = process.env.DRC_PORT ?? '8787'
-const ARTIFACT = process.argv.includes('--bundle') ? path.join(ROOT, 'dist', 'bundle', 'main.js') : path.join(ROOT, 'dist', 'src', 'main.js')
+const ARTIFACT = process.argv.includes('--bundle')
+  ? path.join(ROOT, 'dist', 'bundle', 'main.js')
+  : path.join(ROOT, 'dist', 'src', 'main.js')
 
 /**
  * 从 patch 文件里取 `hostToken:` 的值（可有可无可选引号）。
@@ -79,9 +81,13 @@ function start() {
       // 只在长度 >= 4 时才取前 4 位：短于 4 的 token，`%${VAR#????}` 求值出的是**整个值**，
       // 那句"任何情况下只打印前 4 位"会在这里当场破功（v2 的 P2）。
       if (token.length >= 4) {
-        process.stdout.write(`relay-start: 从 ${PATCH_FILE} 读到 hostToken（以 ${token.slice(0, 4)}… 开头，完整值不打印）\n`)
+        process.stdout.write(
+          `relay-start: 从 ${PATCH_FILE} 读到 hostToken（以 ${token.slice(0, 4)}… 开头，完整值不打印）\n`,
+        )
       } else {
-        process.stdout.write(`relay-start: 从 ${PATCH_FILE} 读到 hostToken（长度 ${token.length}，短于 4 字符，完整值不打印）\n`)
+        process.stdout.write(
+          `relay-start: 从 ${PATCH_FILE} 读到 hostToken（长度 ${token.length}，短于 4 字符，完整值不打印）\n`,
+        )
       }
     }
   }

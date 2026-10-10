@@ -657,6 +657,7 @@ drc-relay-install.cmd install
 Node 收不到 `SIGTERM`，于是排空（`close`）与兜底落盘（`forceShutdown`）一次都不跑。
 v3 为此把停机做成了**可显式调用的出口**（`src/lifecycle.ts`），并让安装脚本把
 `AppStopMethodConsole` 设成"先发 Ctrl+C"：那 15 秒里优雅停机才跑得起来。
+
 > Linux 上 systemd 的 `KillSignal=SIGTERM` 天生就走到那条路，Windows 要显式配。
 
 依赖 NSSM 是**外部**依赖，不进本仓——它是"Windows 没有内置 service wrapper"的事实所迫

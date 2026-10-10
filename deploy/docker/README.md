@@ -28,11 +28,11 @@ nginx 终止。切容器化不动证书、不动反代，只换进程托管方�
 
 三个必须自己记住的点：
 
-| 项 | 值 | 不这么做会怎样 |
-| --- | --- | --- |
-| `DRC_BIND` | 镜像里已经是 `0.0.0.0`，compose 里显式写死 | 容器内绑 `127.0.0.1` → `-p` 发布成功但**外面连不上** |
-| 端口发布 | `127.0.0.1:8787:8787` | 绑 `0.0.0.0:8787:8787` → 8787 直接暴露公网，绕过 nginx 的按 IP 限流 |
-| `/data` 属主 | `10001:10001` | 状态写不进去。2.x 起启动时会直接记一条 `state file is not writable` 的 **error**；1.x 时代只能等第一条 `state file write failed` 的 warn |
+| 项           | 值                                         | 不这么做会怎样                                                                                                                           |
+| ------------ | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `DRC_BIND`   | 镜像里已经是 `0.0.0.0`，compose 里显式写死 | 容器内绑 `127.0.0.1` → `-p` 发布成功但**外面连不上**                                                                                     |
+| 端口发布     | `127.0.0.1:8787:8787`                      | 绑 `0.0.0.0:8787:8787` → 8787 直接暴露公网，绕过 nginx 的按 IP 限流                                                                      |
+| `/data` 属主 | `10001:10001`                              | 状态写不进去。2.x 起启动时会直接记一条 `state file is not writable` 的 **error**；1.x 时代只能等第一条 `state file write failed` 的 warn |
 
 ## 运维
 
@@ -82,6 +82,7 @@ docker compose -f deploy/docker/compose.yaml up -d
    // /etc/docker/daemon.json
    { "registry-mirrors": ["https://6faa0280329c285d57dd15ba1333bdeb.d.1ms.run"] }
    ```
+
    ```sh
    systemctl daemon-reload && systemctl restart docker
    ```
@@ -93,14 +94,19 @@ docker compose -f deploy/docker/compose.yaml up -d
    >
    > 配完**必须核对 digest**，不能只看「拉下来了」：加速站是第三方，
    > 拉到的内容是不是官方的，靠 `RepoDigests` 说话。
+   >
    > ```sh
    > docker image inspect node:22-alpine --format '{{index .RepoDigests 0}}'
    > # node@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
    > ```
+   >
    > 与直连 Docker Hub 拉到的是**同一个 digest**，才是可信的（2026-10-07 实测）。
    >
    > **加速地址会变**：它是按账号发的，换账号/换机器就是另一个串。
    > 上面那个是 2026-10-07 生产实测可用的那一个；失效时按本文另一条路走。
+
+   ```
+
    ```
 
 2. **本地打标签**：从可达的镜像站拉一份再改名，docker build 就不解析远端了。

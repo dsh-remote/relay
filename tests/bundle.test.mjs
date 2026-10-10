@@ -9,6 +9,7 @@
  *   于是生产部署退化成"scp 一个文件 + systemctl restart"，
  *   少一步 `npm install`，也就少一类"服务器上的依赖树和 CI 不一样"的故障。
  */
+import { stopChild } from './child-harness.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { copyFileSync, mkdtempSync, readFileSync, statSync } from 'node:fs'
@@ -94,9 +95,11 @@ test('单文件在没有 node_modules 的空目录里能启动、应答健康检
     )
     assert.match(readFileSync(BUNDLE, 'utf8'), new RegExp(`"${pkg.version}"`), 'define 没有真的落进产物')
 
-    const exitCode = new Promise((resolve) => child.on('exit', resolve))
-    child.kill('SIGTERM')
-    assert.equal(await Promise.race([exitCode, sleep(3000).then(() => 'timeout')]), 0, '优雅停机必须 exit 0')
+    // 收场走共用装置（2026-10-08）：它带上限 + SIGKILL 兜底。
+    // 原来这里自己 race 了一个 3 秒的 sleep —— 能用，但那是**第四份**收场写法，
+    // 而"收场有没有上限"正是 2026-10-08 在 Linux 腿上抓到过的坑，不该有第四份。
+    const code = await stopChild(child)
+    assert.equal(code, 0, `优雅停机必须 exit 0（实得 ${code}；'timeout' = 3 秒内没退出）`)
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL')
   }

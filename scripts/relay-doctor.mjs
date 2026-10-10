@@ -74,10 +74,28 @@ function fetchJson(url) {
  * 新字段默认**不出现**在这份诊断里，要出现必须有人在这里加一行。
  */
 const READ = [
-  'ok', 'version', 'uptimeSec', 'hosts', 'clients', 'conversations', 'pendingPairs',
-  'droppedFrames', 'slowConsumers', 'rejectedPairs', 'shutdownForced',
-  'persistence', 'stateRestored', 'stateSavedAtSec', 'stateWrites', 'stateWriteFailures',
-  'shuttingDown', 'protocolSelf', 'protocolMin', 'peerProtocolMin', 'peerProtocolMax', 'peersNoProtocol',
+  'ok',
+  'version',
+  'uptimeSec',
+  'hosts',
+  'clients',
+  'conversations',
+  'pendingPairs',
+  'droppedFrames',
+  'slowConsumers',
+  'rejectedPairs',
+  'shutdownForced',
+  'persistence',
+  'stateRestored',
+  'stateSavedAtSec',
+  'stateWrites',
+  'stateWriteFailures',
+  'shuttingDown',
+  'protocolSelf',
+  'protocolMin',
+  'peerProtocolMin',
+  'peerProtocolMax',
+  'peersNoProtocol',
 ]
 const pick = (src) => Object.fromEntries(READ.filter((k) => src[k] !== undefined).map((k) => [k, src[k]]))
 
@@ -93,13 +111,21 @@ async function main() {
     // 过白名单再进诊断逻辑：即使响应里混进了凭据字段，下面的代码也看不到它。
     health = pick(await fetchJson(`${baseUrl}/healthz`))
   } catch (error) {
-    report('bad', `连不上 /healthz —— ${String(error?.message ?? error)}`, '看服务是否在跑；反代是否转发了 Upgrade 头；端口对不对')
+    report(
+      'bad',
+      `连不上 /healthz —— ${String(error?.message ?? error)}`,
+      '看服务是否在跑；反代是否转发了 Upgrade 头；端口对不对',
+    )
     print()
     return 1
   }
 
   // ① 活着没
-  if (health.ok === true) report('ok', `服务在跑（版本 ${health.version ?? '未知'}，已运行 ${Math.round((health.uptimeSec ?? 0) / 60)} 分钟）`)
+  if (health.ok === true)
+    report(
+      'ok',
+      `服务在跑（版本 ${health.version ?? '未知'}，已运行 ${Math.round((health.uptimeSec ?? 0) / 60)} 分钟）`,
+    )
   else report('bad', '/healthz 的 ok 不是 true', '看日志里的 fatal 行')
 
   // ② 版本对不对（运维判断"线上跑的是哪一版"就靠这个字段）
@@ -122,7 +148,17 @@ async function main() {
         '查状态目录权限与磁盘空间；systemd 下要 StateDirectory（见 deploy/systemd）',
       )
     } else if (Number(health.stateWrites) > 0) {
-      report('ok', `落盘正常（已写 ${health.stateWrites} 次，最后一次 ${health.stateSavedAtSec ? new Date(Number(health.stateSavedAtSec) * 1000).toISOString() : '未知'}）`)
+      // ⚠️ `stateSavedAtSec` 是**进程内的第几秒**（相对 uptimeSec），**不是 epoch 秒**——
+      // 按epoch 解读会渲染成 1970-01-01T00:00:06（2026-10-08 对着线上实例实测踩到）。
+      // 字段名里的 `At` 有歧义，而这里能做的只有按实测语义解读：相对 uptime 的偏移。
+      const savedAt = Number(health.stateSavedAtSec)
+      const uptime = Number(health.uptimeSec)
+      const agoSec =
+        Number.isFinite(savedAt) && Number.isFinite(uptime) ? Math.max(0, Math.round(uptime - savedAt)) : null
+      report(
+        'ok',
+        `落盘正常（已写 ${health.stateWrites} 次，最近一次在${agoSec === null ? '未知时刻' : `${agoSec} 秒前`}）`,
+      )
     } else {
       report('warn', '配好了落盘但一次都没写成功过', '会话表没变化时不写是正常的；跑一次配对再复查')
     }
@@ -130,7 +166,10 @@ async function main() {
   if (health.stateRestored === true) report('ok', '上次启动从状态文件恢复了会话表')
 
   // ④ 连接与限流（排错时最常问的三个数）
-  report('info', `连接：主机 ${health.hosts ?? 0} · 客户端 ${health.clients ?? 0} · 会话 ${health.conversations ?? 0} · 待配对 ${health.pendingPairs ?? 0}`)
+  report(
+    'info',
+    `连接：主机 ${health.hosts ?? 0} · 客户端 ${health.clients ?? 0} · 会话 ${health.conversations ?? 0} · 待配对 ${health.pendingPairs ?? 0}`,
+  )
   if (Number(health.droppedFrames) > 0) {
     report('warn', `丢过 ${health.droppedFrames} 帧`, '多为慢消费者；调 DRC_MAX_BUFFERED_BYTES 或两个慢消费者窗口')
   }
@@ -138,10 +177,18 @@ async function main() {
     report('warn', `有 ${health.slowConsumers} 个慢消费者被处置过`, '看对端网络；客户端窗口必须大于它自己的重连周期')
   }
   if (Number(health.rejectedPairs) > 0) {
-    report('warn', `拒绝过 ${health.rejectedPairs} 次配对`, '多为 token 不一致——确认插件与中继的 DRC_HOST_TOKEN 逐字相同')
+    report(
+      'warn',
+      `拒绝过 ${health.rejectedPairs} 次配对`,
+      '多为 token 不一致——确认插件与中继的 DRC_HOST_TOKEN 逐字相同',
+    )
   }
   if (Number(health.shutdownForced) > 0) {
-    report('warn', `上次停机排空超时 ${health.shutdownForced} 次（强制退出）`, '有连接没在 5 秒内结束；也可能是被硬杀的（Windows 服务停止 / docker kill）')
+    report(
+      'warn',
+      `上次停机排空超时 ${health.shutdownForced} 次（强制退出）`,
+      '有连接没在 5 秒内结束；也可能是被硬杀的（Windows 服务停止 / docker kill）',
+    )
   }
 
   // ⑤ 协议版本协商

@@ -13,6 +13,7 @@
  * 短 token 那条真的起一次脚本、看它有没有把值打出来；收尾那条真的让装置抛错，
  * 再看子中继有没有走完停机（停机路径会补写一次状态文件，见下）。
  */
+import { stopChild, waitExit } from './child-harness.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
@@ -94,8 +95,10 @@ test('relay-start.mjs：patch 文件里的短 token 一个字符都不打印（�
       assert.ok(!out.includes('abc'), `短 token 的值被打出来了：${out.slice(0, 200)}`)
       assert.match(out, /短于 4 字符/, '短 token 要走守卫分支并说明只报了长度')
     } finally {
-      child.kill('SIGTERM')
-      await new Promise((resolve) => child.on('exit', resolve))
+      // ⚠️ 带上限（2026-10-08）：原来这里是 `kill` + 无界 `await exit`，
+      // 而这个装置测的正是"脚本起不来"的路径 —— 子进程可能压根不理 SIGTERM，
+      // 无界等待就把一条红判据变成整套测试的挂死。
+      await stopChild(child)
     }
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -134,7 +137,7 @@ test('loadtest-conns.mjs：装置自己抛错时也回收子中继（try/finally
     )
     let stderr = ''
     child.stderr.on('data', (c) => (stderr += c.toString()))
-    const exited = new Promise((resolve) => child.on('exit', resolve))
+    const exited = waitExit(child, { timeoutMs: 10_000 })
 
     // 采样期第一次 `statSync(relayLogPath)` 之前把中继日志删掉：装置会在
     // "子进程已经起来之后"抛错——这正是旧实现把子进程留在机器上的那条路径。
@@ -151,6 +154,7 @@ test('loadtest-conns.mjs：装置自己抛错时也回收子中继（try/finally
     unlinkSync(logFile)
 
     const code = await exited
+    assert.notEqual(code, 'timeout', '装置 10 秒内没退出：它本该抛错退出，卡住就是回归')
     assert.notEqual(code, 0, `装置抛错后必须非 0 退出（实际 ${code}）`)
     assert.match(stderr, /loadtest 失败/, `失败原因要落在 stderr 上：${stderr.slice(0, 300)}`)
     assert.ok(

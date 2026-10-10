@@ -45,14 +45,14 @@ services:
 
     ports:
       # 只绑回环。公网走 443（宿主机 nginx），8787 不对公网。
-      - "127.0.0.1:${DRC_PORT:-8787}:${DRC_PORT:-8787}"
+      - '127.0.0.1:${DRC_PORT:-8787}:${DRC_PORT:-8787}'
 
     environment:
       # 唯一必填项。写错/漏写时 compose 在**启动前**就报出来，而不是让容器起来
       # 再自己拒绝启动（那时报错在 logs 里，人不一定看）。
       DRC_HOST_TOKEN: ${DRC_HOST_TOKEN:?在 deploy/docker/.env 里设 DRC_HOST_TOKEN（openssl rand -hex 32）}
       DRC_PORT: ${DRC_PORT:-8787}
-      DRC_BIND: "0.0.0.0"
+      DRC_BIND: '0.0.0.0'
       DRC_PUBLIC_URL: ${DRC_PUBLIC_URL:-}
       DRC_LOG_LEVEL: ${DRC_LOG_LEVEL:-info}
       DRC_PAIR_TTL_MS: ${DRC_PAIR_TTL_MS:-120000}
@@ -99,11 +99,17 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "5"
+        max-size: '10m'
+        max-file: '5'
 
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.DRC_PORT||8787)+'/healthz').then(r=>r.json()).then(j=>process.exit(j.ok===true?0:1)).catch(()=>process.exit(1))"]
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:'+(process.env.DRC_PORT||8787)+'/healthz').then(r=>r.json()).then(j=>process.exit(j.ok===true?0:1)).catch(()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3

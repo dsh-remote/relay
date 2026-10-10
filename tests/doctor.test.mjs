@@ -14,6 +14,7 @@
  * `dist/src/main.js` 子进程（真 HTTP、真 `/healthz`），把诊断脚本打上去看输出——
  * 这条链路上的每一环都是真的，包括超时与退出码。
  */
+import { killChildNow, stopChild } from './child-harness.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
@@ -41,33 +42,49 @@ async function startRelay(env = {}) {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
-  const port = await new Promise((resolve, reject) => {
-    let buf = ''
-    const onData = (chunk) => {
-      buf += chunk
-      for (const line of buf.split('\n')) {
-        try {
-          const rec = JSON.parse(line)
-          if (rec.msg === 'relay listening') resolve(rec.port)
-        } catch {
-          /* 半行 */
+  let port
+  try {
+    port = await new Promise((resolve, reject) => {
+      let buf = ''
+      const onData = (chunk) => {
+        buf += chunk
+        for (const line of buf.split('\n')) {
+          try {
+            const rec = JSON.parse(line)
+            if (rec.msg === 'relay listening') resolve(rec.port)
+          } catch {
+            /* 半行 */
+          }
         }
       }
-    }
-    child.stdout.on('data', onData)
-    child.stderr.on('data', onData)
-    child.on('exit', (code) => reject(new Error(`中继提前退出 code=${String(code)}：${buf.slice(-400)}`)))
-    setTimeout(() => reject(new Error(`中继 8 秒内没报端口：${buf.slice(-400)}`)), 8000)
-  })
+      child.stdout.on('data', onData)
+      child.stderr.on('data', onData)
+      child.on('exit', (code) => reject(new Error(`中继提前退出 code=${String(code)}：${buf.slice(-400)}`)))
+      setTimeout(() => reject(new Error(`中继 8 秒内没报端口：${buf.slice(-400)}`)), 8000)
+    })
+  } catch (error) {
+    // ⚠️ 失败路径上**必须自己收场**：这一支 reject 之后 `relay.stop()` 不会被注册
+    //（它挂在 `t.after` 里，而那要等 await 成功），子进程就成了没人管的孤儿 ——
+    // 它的管子一直开着，node:test 永远等不到事件循环排空。
+    // 这正是 2026-10-08 在 Linux 腿看到的"整套 gates 挂住"的成因。
+    killChildNow(child)
+    throw error
+  }
   return {
     child,
     port,
-    stop: () =>
-      new Promise((resolve) => {
-        if (child.exitCode !== null) return resolve()
-        child.once('exit', () => resolve())
-        child.kill('SIGTERM')
-      }),
+    /**
+     * 收场。
+     *
+     * ⚠️ **必须有上限**（2026-10-08 加，Linux 腿实测）：SIGTERM 之后等 `exit` 是
+     * 无界的，而子进程只要还在，它的 stdio 管子就开着 —— 测试进程**永远退不出去**。
+     * 那不是"某条判据红"，是 `pnpm gates` 整个挂住（症状：最后一行日志之后再无输出）。
+     * 所以 3 秒后补 SIGKILL；超时只影响本用例，不影响整套。
+     */
+    // 收场走共用装置（2026-10-08）：它带上限，且 SIGKILL 之后**仍有**上限 ——
+    // 本文件原来自己写的那份是"3 秒后补 SIGKILL，然后一直等 exit"，
+    // 而发出 SIGKILL 不等于它会退出（Linux 上实测到卡在不可中断系统调用里的进程）。
+    stop: () => stopChild(child),
   }
 }
 
@@ -116,7 +133,15 @@ test('落盘写失败要被抓出来并说清怎么查（自建最常见的静�
   // 把状态目录指向一个不可写的路径 ⇒ 周期补写会一直失败
   const dir = mkdtempSync(join(tmpdir(), 'drc-doctor-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const relay = await startRelay({ DRC_STATE_FILE: '/proc/definitely-not-writable/state.json' })
+  // ⚠️ 路径的选择是**平台相关**的（2026-10-08 在 Linux 腿上实测出来的）：
+  //   原来用的 `/proc/definitely-not-writable/state.json` 只在 macOS 上是"不可写的路径"——
+  //   而 Linux 的 `/proc` 是真实文件系统，`mkdir -p /proc/…` 会**永久阻塞**
+  //   （实测：`mkdirSync('/proc/x', {recursive:true})` 永不返回，中继卡在启动、
+  //    连 "relay listening" 都不打，而进程在烧 CPU）。
+  //   那条夹具于是变成"在 Linux 上测的是另一个东西（而且测不完）"。
+  //   `/dev/null/…` 两边都是**瞬时** ENOTDIR —— 目录建不出来，于是每次写都失败，
+  //   正是这条要验的东西。
+  const relay = await startRelay({ DRC_STATE_FILE: '/dev/null/not-a-directory/state.json' })
   t.after(() => relay.stop())
 
   // 等第一轮周期补写（默认 60s 太长，这里直接把窗口调小）
@@ -130,18 +155,16 @@ test('落盘写失败要被抓出来并说清怎么查（自建最常见的静�
   }
   // ⚠️ 这条断言的是**诊断逻辑认得这个字段**（不是等待真实失败）：
   // 不同平台上"写不进 /proc/…"的失败时机不同，强求真的失败会让判据变脆。
-  assert.match(
-    out,
-    /落盘|persistence/,
-    '诊断输出必须谈到落盘：stateWriteFailures>0 时要报"配对表没有真正写进盘"',
-  )
+  assert.match(out, /落盘|persistence/, '诊断输出必须谈到落盘：stateWriteFailures>0 时要报"配对表没有真正写进盘"')
 })
 
 test('只读白名单：响应里混进凭据字段也不会被印出来', async (t) => {
   // 用一个**假的 /healthz**：它在响应里塞一个看起来像凭据的字段。
   // 诊断脚本不该打印它——这就是"白名单"这条纪律的可测形态。
   // 假中继：从临时脚本起（内联 -e 的写法在箭头函数里拿不到端口）
-  const fake = spawn(process.execPath, [join(ROOT, 'tests', 'fixtures', 'fake-healthz.mjs'), TOKEN], { stdio: ['ignore', 'pipe', 'pipe'] })
+  const fake = spawn(process.execPath, [join(ROOT, 'tests', 'fixtures', 'fake-healthz.mjs'), TOKEN], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
   const port = await new Promise((resolve, reject) => {
     let buf = ''
     fake.stdout.on('data', (c) => {
@@ -160,4 +183,21 @@ test('只读白名单：响应里混进凭据字段也不会被印出来', async
     `白名单外的字段被印出来了：\n${out.slice(0, 600)}\n——诊断只该读它显式列出的那二十来个字段`,
   )
   assert.match(out, /一切正常|✅/, '而白名单里的字段照常出现在诊断里')
+})
+
+test('落盘时间不许渲染成 1970 年（stateSavedAtSec 是"进程内第几秒"，不是 epoch）', async (t) => {
+  // 线上实测（2026-10-08，`/healthz` 真实返回）：stateSavedAtSec = 6、uptimeSec = 66。
+  // 我第一版按 epoch 秒渲染 ⇒ 输出「1970-01-01T00:00:06.000Z」。
+  // 字段名里的 `At` 有歧义（这是上游的命名问题，不改契约），诊断脚本必须按实测语义解读。
+  const relay = await startRelay()
+  t.after(() => relay.stop())
+  await sleep(50)
+
+  const { out } = runDoctor(`http://127.0.0.1:${relay.port}`)
+  assert.doesNotMatch(
+    out,
+    /1970-01-01/,
+    `诊断输出里出现了 1970 年：stateSavedAtSec 是进程内相对秒数，按 epoch 解读就会这样\n${out.slice(0, 400)}`,
+  )
+  assert.doesNotMatch(out, /T00:00:/, '输出里出现了 ISO 时间戳（那正是把相对秒当 epoch 的形状）')
 })

@@ -47,12 +47,61 @@ WORKDIR /src
 # 先只拷锁文件再装：pnpm 的安装缓存按 lockfile 命中，改 src 不必重装依赖树。
 # --frozen-lockfile 是刻意的——镜像里装的必须与提交的 lockfile 逐位一致，
 # "构建时顺手升了某个传递依赖"这类漂移正是要消掉的。
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+#
+# ## v3 单仓：这里的 COPY 必须带 packages/ 前缀（2026-10-08 修）
+#
+# v2 时这个仓是**独立仓**，build 上下文（compose 的 `context: ../..`）就是本仓根，
+# 所以 `COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./` 拷的是"本包 + 本包锁"。
+# v3 变成 monorepo 后，同一行拷的是 **monorepo 根**的三个文件——而根 package.json 里
+# 没有 relay 的依赖，于是 pnpm 报的错是「lockfile 里有 ^22.9.0、manifest 要 ^26.6.3」
+# 这类**看起来毫不相关**的 mismatch（真实原因：那份 package.json 不是这个包的）。
+#
+# 症状与判据：`docker compose build` 失败，而 `pnpm install` 在本机完全正常。
+# 所以下面显式列出三个路径，让"上下文是单仓根"这件事变成 Dockerfile 自己保证的。
+# ⚠️ 下面几行的行尾**不许带注释** —— Dockerfile 会把 `#` 之后的内容也当成拷贝路径
+# （报错形态：`"/需要它要解": not found`，看起来像文件不存在，其��是把注释当路径了）。
+# 要说明就写在上一行。
+COPY pnpm-workspace.yaml ./
+COPY pnpm-lock.yaml ./
+# monorepo 根清单：pnpm 需要它来解 workspace（里面没有 relay 的依赖，只负责解析结构）
+COPY package.json ./
+#
+# ⚠️ **pnpm-workspace.yaml 声明的每一个包都要有 package.json 在场**，少一个都不行。
+# 缺的那几个不会报"文件不存在"，而是报 `specifiers in the lockfile don't match`，
+# 并把**缺的包的依赖名**列出来（第一次栽在这里：漏了 plugin/client/e2e，于是报错说
+# 「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」——那是 plugin 的 @types/node，
+# 与 relay 一点关系都没有 ⇒ 看起来像 lockfile 坏了，其��是清单没拷全）。
+# 镜像只需要 relay + protocol 的源码，但**清单必须全在场**，否则 pnpm 在 install 阶段就退出了。
+COPY packages/relay/package.json ./packages/relay/
+COPY packages/protocol/package.json ./packages/protocol/
+#
+# ⚠️ **不需要**把 workspace 里其他包（plugin / client / e2e）的 package.json 也拷进来。
+# 我一度以为"声明的包必须清单齐备"，为此加了三条 COPY —— 那三条**无效**：
+# 删掉之后 `pnpm install --frozen-lockfile` 照样通过（2026-10-08 在服务器上实测过：
+# 只放 protocol + relay 两份清单，frozen 检查顺利过，只在下一步因缺 protocol 的
+# tsconfig 而失败）。pnpm 只校验**它要解析的那些 importer**。
+#
+# 那次「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」的 mismatch 真相不是"清单没拷全"，
+# 而是**根 package.json 被污染**：上传源码时用 `tar xzf`，relay 的 package.json
+# 覆盖到了仓库根，于是 pnpm 拿 relay 的依赖去比根的 lock ⇒ 报出 relay 的依赖名。
+# ⇒ **报错指错地方时，先怀疑"文件被覆盖"，别急着加 COPY。**
+#
+# protocol 的 src + tsconfig 必须在 install **之前**进来：
+# 它的 `prepare: tsc -p tsconfig.json` 是 install 生命周期的一环，
+# 顺序写反的报错是 `TS5058: path does not exist`，出现在 install 阶段。
+COPY packages/protocol/tsconfig.json ./packages/protocol/
+COPY packages/protocol/src ./packages/protocol/src
 RUN corepack enable && pnpm install --frozen-lockfile
 
-COPY tsconfig.json ./
-COPY src ./src
-COPY scripts ./scripts
+COPY packages/relay/tsconfig.json ./packages/relay/
+COPY packages/relay/src ./packages/relay/src
+COPY packages/relay/scripts ./packages/relay/scripts
+# protocol 必须**先构建**：它是 workspace 依赖，`pnpm install` 只软链它的 package.json，
+# 而 bundle 脚本按 node_modules 解析 ⇒ 拿到的必须是 `dist/src/**`（main 字段指向那里）。
+# 少这一步的报错形态是 esbuild 找不到 `@dsh-remote/protocol/dist/src/index.js`。
+RUN pnpm --filter @dsh-remote/protocol build
+# 在 relay 包目录里构建：它的 tsconfig 与 bundle 脚本都以包根为基准
+WORKDIR /src/packages/relay
 RUN pnpm build
 
 # 产物级断言。两条取自 tests/bundle.test.mjs 的同款断言，写在这里是因为
@@ -70,7 +119,7 @@ ARG VCS_REF=unknown
 LABEL org.opencontainers.image.title="dsh-remote-relay" org.opencontainers.image.description="Zero-knowledge WebSocket relay for DSH Remote Control" org.opencontainers.image.source="https://github.com/providcc/dsh-remote-server" org.opencontainers.image.licenses="MIT" org.opencontainers.image.version="${DRC_VERSION}" org.opencontainers.image.revision="${VCS_REF}"
 
 WORKDIR /app
-COPY --from=build /src/dist/bundle/main.js /app/relay.mjs
+COPY --from=build /src/packages/relay/dist/bundle/main.js /app/relay.mjs
 
 # 只有这两个。**故意不设 DRC_STATE_FILE**：镜像里的默认值要与裸机（systemd 单元）一致——
 # 不配就是纯内存、配了才落盘。落盘路径属于"部署形态"而不是"程序形态"，它与卷是一对，

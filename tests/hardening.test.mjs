@@ -7,6 +7,7 @@
  * 端口用 `DRC_PORT=0` 让系统分配，再从启动日志里读回真实端口：
  * 不猜端口、不撞端口，也不依赖本机有空闲的固定端口。
  */
+import { stopChild, waitExit } from './child-harness.mjs'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
@@ -58,10 +59,10 @@ async function boot(env = {}) {
     lines,
     url: `ws://127.0.0.1:${port}`,
     text: () => lines.join('\n'),
-    async kill() {
-      if (child.exitCode === null) child.kill('SIGKILL')
-      await sleep(50)
-    },
+    // 收场走共用装置（2026-10-08）：原来这里是"发一个 SIGKILL 睡 50ms"——
+    // 不等退出，于是子进程可能在测试结束后还活着几十毫秒；而 SIGKILL 对
+    // 卡在不可中断系统调用里的进程**也不保证**退出，所以要"杀了 + 等到它真的没了"。
+    kill: () => stopChild(child),
   }
 }
 
@@ -105,7 +106,8 @@ test('没有 DRC_HOST_TOKEN 就拒绝启动（CI 里也守这条）', async () =
   const child = spawn(process.execPath, [MAIN], { env, stdio: ['ignore', 'pipe', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (c) => (stderr += c.toString()))
-  const code = await new Promise((resolve) => child.on('exit', resolve))
+  const code = await waitExit(child, { timeoutMs: 8000 })
+  assert.notEqual(code, 'timeout', '中继没有在 8 秒内退出：它本该因为缺 token 直接失败')
   assert.notEqual(code, 0)
   assert.match(stderr, /DRC_HOST_TOKEN/, '报错必须说清楚缺哪个变量')
 })
@@ -119,7 +121,8 @@ test('坏配置直接失败：端口越界与未知日志级别', async () => {
     let out = ''
     child.stdout.on('data', (c) => (out += c.toString()))
     child.stderr.on('data', (c) => (out += c.toString()))
-    const code = await new Promise((resolve) => child.on('exit', resolve))
+    const code = await waitExit(child, { timeoutMs: 8000 })
+    assert.notEqual(code, 'timeout', `中继没有在 8 秒内退出（${JSON.stringify(env)}）`)
     assert.notEqual(code, 0, JSON.stringify(env))
     assert.match(out, /DRC_|必须是/, JSON.stringify(env))
   }
@@ -133,11 +136,10 @@ test('SIGTERM：对端收到 1001，进程 exit 0（systemd 的 TimeoutStopSec �
     peer.send({ t: 'hello', role: 'client', clientId: 'term-1' })
     await waitFrames(peer, 1)
     const closed = peer.closed
-    server.child.kill('SIGTERM')
+    const code = await stopChild(server.child)
     const verdict = await closed
     assert.equal(verdict.code, 1001)
-    const code = await new Promise((resolve) => server.child.on('exit', resolve))
-    assert.equal(code, 0)
+    assert.equal(code, 0, `优雅停机的退出码是 ${code}（'timeout' = 它没在 3 秒内退出 ⇒ 这条会挂住而不是红）`)
     assert.match(server.text(), /"msg":"shutting down"/)
   } finally {
     await server.kill()

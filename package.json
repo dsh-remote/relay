@@ -1,6 +1,6 @@
 {
   "name": "@dsh-remote/relay",
-  "version": "2.0.21",
+  "version": "3.0.6",
   "private": true,
   "description": "DSH Remote Control 的零知识 WebSocket 中继：只做路由，不碰载荷明文。可自托管的单文件产物。",
   "type": "module",
@@ -38,7 +38,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@dsh-remote/protocol": "workspace:*",
+    "@dsh-remote/protocol": "^3.0.0",
     "@types/node": "^26.6.3",
     "@types/ws": "^8.5.12",
     "esbuild": "^0.28.2",
