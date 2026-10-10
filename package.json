@@ -1,6 +1,6 @@
 {
   "name": "@dsh-remote/relay",
-  "version": "3.0.7",
+  "version": "3.0.8",
   "private": true,
   "description": "DSH Remote Control 的零知识 WebSocket 中继：只做路由，不碰载荷明文。可自托管的单文件产物。",
   "type": "module",
