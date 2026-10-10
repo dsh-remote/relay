@@ -32,7 +32,7 @@
     "build": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs",
     "start": "node dist/bundle/main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs && node --test \"tests/*.test.mjs\"",
+    "test": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs && node --test --test-timeout=60000 \"tests/*.test.mjs\"",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
