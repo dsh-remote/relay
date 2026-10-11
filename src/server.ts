@@ -17,7 +17,7 @@
  * 短命状态，落盘它们只会造出"幽灵对端"。详见 `persist.ts`。
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
-import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import { type EndpointFrame, type ErrorCode, type RelayFrame } from '@dsh-remote/protocol/frames'
 import { newHostId } from '@dsh-remote/protocol/ids'
@@ -160,6 +160,17 @@ function tokenMatches(expected: string, got: string): boolean {
   return timingSafeEqual(a, b)
 }
 
+/**
+ * 同一 IP 两次认领的最短间隔（毫秒）。
+ *
+ * 4000 = 每人每分钟最多 15 枚。它挡的是"脚本连打"与误触重复点击；
+ * ⚠️ **挡不住换源 IP 的分布式刷** —— 那要在运维侧解决（这台中继给谁用）。
+ */
+const CLAIM_MIN_INTERVAL_MS = 4_000
+
+/** 认领限频表的容量上限：满了就丢最旧的一批（`Map` 保持插入顺序）。 */
+const CLAIM_TRACK_MAX = 10_000
+
 export function createRelay(config: RelayConfig): RelayHandle {
   const log = new Log(config.logLevel)
   const state = new RelayState({ maxPendingPairs: config.maxPendingPairs })
@@ -169,11 +180,42 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const pairStatusBudget = new Budget(config.pairStatusBudgetPerSec)
   const peers = new WeakMap<WebSocket, Peer>()
   let shuttingDown = false
+  /**
+   * **当前有效的 host token**（2026-10-11 起可变）。
+   *
+   * 之前是直接读 `config.hostToken`（只读），所以「随时换 token」没有出口。
+   * 现在认领接口轮换的是这一份，而 `config.hostToken` 仍作为**启动初值** ——
+   * 于是重启后若没人认领，新进程会回到 env 里那枚（运维改 env 的老路仍然有效）。
+   */
+  let currentHostToken = config.hostToken
+  /** 认领限频表：IP → 上次认领时刻。有界（见下方裁剪），不是无限增长的字典。 */
+  const lastClaimAt = new Map<string, number>()
   let sweepTimer: NodeJS.Timeout | undefined
   let pingTimer: NodeJS.Timeout | undefined
   let lastPingAt = 0
   /** 上一次把计数器抄进日志的时刻（0 = 还没抄过，所以启动后第一轮就抄）。 */
   let lastCountersAt = 0
+
+  /**
+   * 轮换 host token：**旧的那枚立刻失效**。
+   *
+   * 长度与 env 里那枚一致（48 十六进制字符）—— `tokenMatches` 是定长比较，
+   * 长度变了不会报错、只会让所有已装机的主机**静默**连不上，所以这里必须对齐。
+   * 长度口径取自 `docs/RELEASE.md` 里那句「`openssl rand -hex 24`」。
+   */
+  function rotateHostToken(): string {
+    currentHostToken = randomBytes(24).toString('hex')
+    if (lastClaimAt.size >= CLAIM_TRACK_MAX) {
+      // `Map` 按插入顺序迭代 ⇒ 丢最老的一批就是先到的那些
+      const drop = lastClaimAt.size - CLAIM_TRACK_MAX + 1
+      let i = 0
+      for (const key of lastClaimAt.keys()) {
+        lastClaimAt.delete(key)
+        if (++i >= drop) break
+      }
+    }
+    return currentHostToken
+  }
 
   // ── 会话表落盘（HANDOFF §1.1 方案 A，DRC_STATE_FILE 未设时整段是死代码）──
 
@@ -538,12 +580,12 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
     peer.protocol = frame.protocol
     if (frame.role === 'host') {
-      if (!config.hostToken) {
+      if (!currentHostToken) {
         sendError(peer, 'internal', 'relay has no host token configured')
         peer.ws.close(1011)
         return
       }
-      if (!frame.token || !tokenMatches(config.hostToken, frame.token)) {
+      if (!frame.token || !tokenMatches(currentHostToken, frame.token)) {
         peer.authAttempts += 1
         // 只记"第几次失败"，绝不记token 的任何片段。
         log.warn('host auth failed', { attempts: peer.authAttempts })
@@ -1361,6 +1403,63 @@ export function createRelay(config: RelayConfig): RelayHandle {
         // 字段留给人去读。
         if (shuttingDown) res.statusCode = 503
         res.end(JSON.stringify(health()))
+        return
+      }
+      /**
+       * **认领一枚 host token**（2026-10-11）。
+       *
+       * ## 它为什么存在
+       *
+       * 目标形态是「装完就能用」：用户 `npm i` 之后**什么都不用配**。
+       * 而 token 是主机与中继之间的共享密钥 —— 之前只能由用户把它写进
+       * `cordis.patch.yml`，于是"装完不能用"变成了默认结局。
+       *
+       * ## 为什么它**不能**是"谁来问都给 token"
+       *
+       * 中继是公网服务。一个无认证的取值接口 = **token 公开**，
+       * 那比明文写在 `0600` 文件里**更差**（后者只在你机器上，前者全网可取）。
+       * 拿到 token 的人能冒充主机接入，还能发一个与你"在途相同"的配对 token
+       * 把条目改写成自己的 —— 用户扫的是 A 的码、配到的是 B，而两边都不报错
+       * （见 `src/state.ts` 里关于共享 token 的那段注释）。
+       *
+       * ⇒ 所以这里是**认领**而不是**索取**：领到的是**一枚新的、只属于这一台机器的**
+       * token，且旧的那枚**立刻作废**。攻击者能领到自己的那枚（那本来就是给他用的），
+       * **拿不到你的**。
+       *
+       * ## 滥用面（这是这条接口的真实成本，必须写明）
+       *
+       * 任何人都能领一枚 ⇒ 这台中继会**替陌生人中继流量**。他们读不到别人的内容
+       * （载荷密封、中继零知识），但能消耗带宽与配对表容量。
+       * ⇒ 下面三道闸是给它加的，不是装饰：限频、每次认领**作废上一枚**、
+       * 停机中不受理。
+       */
+      if (url.pathname === '/api/claim-token') {
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.end(JSON.stringify({ error: 'use POST' }))
+          return
+        }
+        if (shuttingDown) {
+          res.statusCode = 503
+          res.end(JSON.stringify({ error: 'shutting_down' }))
+          return
+        }
+        const now = Date.now()
+        // 限频：同一 IP 两次认领至少隔 CLAIM_MIN_INTERVAL_MS。
+        // ⚠️ 这挡不住分布式刷（换源 IP），它只挡"脚本连打"这一种。
+        // 真正的总量控制在运维侧（谁在用这台中继、要不要开认领）。
+        const ip = req.socket.remoteAddress ?? 'unknown'
+        const last = lastClaimAt.get(ip) ?? 0
+        if (now - last < CLAIM_MIN_INTERVAL_MS) {
+          res.statusCode = 429
+          res.end(JSON.stringify({ error: 'too_soon', retryAfterMs: CLAIM_MIN_INTERVAL_MS - (now - last) }))
+          return
+        }
+        lastClaimAt.set(ip, now)
+        // 认领即轮换：老的那枚立刻不再有效 ⇒「随时换 token」不需要另开接口。
+        const token = rotateHostToken()
+        log.info('host token claimed', { ip })
+        res.end(JSON.stringify({ token, rotatedAt: new Date(now).toISOString() }))
         return
       }
       if (url.pathname === '/api/info') {
