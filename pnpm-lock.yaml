@@ -10,7 +10,7 @@ importers:
     devDependencies:
       '@dsh-remote/protocol':
         specifier: ^3.0.0
-        version: 3.0.6
+        version: 3.0.7
       '@types/node':
         specifier: ^26.6.3
         version: 26.6.5
@@ -22,7 +22,7 @@ importers:
         version: 0.28.2
       prettier:
         specifier: ^3.3.3
-        version: 3.9.9
+        version: 3.9.10
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -32,8 +32,8 @@ importers:
 
 packages:
 
-  '@dsh-remote/protocol@3.0.6':
-    resolution: {integrity: sha512-GkZOey90Bp98p69Vtj1nozo6vaHh8WUbjN8KUdiq8lKr9yhlTdYR9fupW5lzRZFpdfKokOH2CuOV9WjHYqMz3Q==}
+  '@dsh-remote/protocol@3.0.7':
+    resolution: {integrity: sha512-aZ/Z92FcYB292wQZl/Ktb3nJ9Td3trpKVSzRXQ3rNy7JzuQX8fg5z2sof3QHGE+H0sq0Vy98ETvnuYx0zx1Yvw==}
     engines: {node: '>=20'}
 
   '@esbuild/aix-ppc64@0.28.2':
@@ -323,8 +323,8 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
-  prettier@3.9.9:
-    resolution: {integrity: sha512-Z/CJHIkdujO/OtN7nXUii0Rf3VT5SRuhjBA82Xvu2XhBUgX3nhP67T0LHceBdQLex7OOFGTox+Q5Yg8Jk2Qivg==}
+  prettier@3.9.10:
+    resolution: {integrity: sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==}
     engines: {node: '>=14'}
     hasBin: true
 
@@ -356,7 +356,7 @@ packages:
 
 snapshots:
 
-  '@dsh-remote/protocol@3.0.6':
+  '@dsh-remote/protocol@3.0.7':
     dependencies:
       tweetnacl: 1.0.3
       zod: 4.6.5
@@ -536,7 +536,7 @@ snapshots:
       '@esbuild/win32-ia32': 0.28.2
       '@esbuild/win32-x64': 0.28.2
 
-  prettier@3.9.9: {}
+  prettier@3.9.10: {}
 
   tweetnacl@1.0.3: {}
 

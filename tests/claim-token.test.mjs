@@ -18,8 +18,11 @@ import { createRelay } from '../dist/src/server.js'
 const TOKEN = 'claim-token-test-token-0123456789abcdef'
 const hex48 = (n) => /^[0-9a-f]{48}$/
 
-async function up() {
-  const env = { DRC_HOST_TOKEN: TOKEN, DRC_PORT: '0', DRC_HOST_AUTH_MAX_ATTEMPTS: '5' }
+/** 从认领响应里取 token（取不到就回 undefined，让断言自己红出真实原因）。 */
+const bodyToken = (body) => (typeof body?.token === 'string' ? body.token : undefined)
+
+async function up(overrides = {}) {
+  const env = { DRC_HOST_TOKEN: TOKEN, DRC_PORT: '0', DRC_HOST_AUTH_MAX_ATTEMPTS: '5', ...overrides }
   const { config, problems } = loadConfig(env, 'test')
   assert.equal(problems.filter((p) => p.level === 'error').length, 0, '测试配置不合法')
   const relay = createRelay(config)
@@ -44,12 +47,18 @@ test('认领得到一枚 48 位十六进制 token，且与 env 里那枚不同',
   }
 })
 
-test('认领会轮换：第二枚与第一枚不同（所以"随时换 token"不需要另开接口）', async () => {
-  const { relay, base } = await up()
+test('不带 hostId 的认领仍按旧语义作废上一枚（老客户端 3.1.2 的行为不变）', async () => {
+  // ⚠️ 这条判据的旧版是**假绿**的：它连着 POST 两次，而第二次吃 429、
+  // body 里根本没有 `token`，于是 `a.token !== b.token` 拿一个 undefined 比出了"通过"。
+  // 现在两枚都得先**真拿到**，比值才有意义。限频在这条里被特意关掉
+  // （`DRC_CLAIM_MIN_INTERVAL_MS=0`），限频本身由下面那条用默认配置钉着。
+  const { relay, base } = await up({ DRC_CLAIM_MIN_INTERVAL_MS: '0' })
   try {
     const a = await (await fetch(`${base}/api/claim-token`, { method: 'POST' })).json()
     const b = await (await fetch(`${base}/api/claim-token`, { method: 'POST' })).json()
-    assert.notEqual(a.token, b.token, '两次认领拿到同一枚 ⇒ 轮换没生效')
+    assert.ok(hex48(bodyToken(a)), `第一枚形状不对（限频是不是没关掉？）：${JSON.stringify(a)}`)
+    assert.ok(hex48(bodyToken(b)), `第二枚形状不对（限频是不是没关掉？）：${JSON.stringify(b)}`)
+    assert.notEqual(a.token, b.token, '两次认领拿到同一枚 ⇒ 未绑定槽位没有作废上一枚')
   } finally {
     await relay.close()
   }

@@ -570,8 +570,28 @@ test('计数器按 countersLogMs 抄进日志：累计值从此有历史，且�
       }
     }
     // 这一行会长期留在服务器日志里，所以它一个字都不许带上凭据。
+    //
+    // ⚠️ **口径是"值"而不是"键名"**（2026-10-11 改）。旧版写的是键名正则
+    // `/hostToken|.../`，而 `/healthz` 这轮新增了一个 **`hostTokens` 条数**
+    // （number）⇒ 旧判据把"字段名里带 token"当成泄露，报了一条与事实相反的红。
+    // 真正的泄露只可能是**值**：一枚 48/64 位十六进制的串。所以这里逐个值看。
     const dumped = JSON.stringify(snaps)
-    assert.equal(/hostToken|"token"|psk|secret/i.test(dumped), false, '计数器快照里出现了凭据形态的字段')
+    assert.equal(/psk|secret/i.test(dumped), false, '计数器快照里出现了凭据形态的字段名')
+    assert.equal(
+      /"token"\s*:/i.test(dumped),
+      false,
+      '快照里出现了名为 token 的字段（那说明有人把令牌对象整个抄进来了）',
+    )
+    for (const snap of snaps) {
+      for (const [key, value] of Object.entries(snap)) {
+        if (typeof value !== 'string') continue
+        assert.equal(
+          /^[0-9a-f]{32,}$/i.test(value),
+          false,
+          `计数器快照的 ${key} 是一串凭据形态的值（长十六进制串）：这一行会留在日志里`,
+        )
+      }
+    }
   } finally {
     await server.kill()
   }

@@ -248,9 +248,12 @@ test('counts 与 reset 服务于 /healthz 与测试隔离', () => {
   const { state } = harness()
   state.issuePair('h1', '123456', 180_000)
   state.claim('123456', 'inst-1')
-  assert.deepEqual(state.counts(), { hosts: 1, clients: 1, conversations: 1, pendingPairs: 1 })
+  // hostTokens 是这一轮新增的第五张表（按 hostId 一机一枚）：`counts()` 少报它
+  // ⇒ /healthz 上看不出令牌表在长，而它正是"认领没人管"那类故障的唯一观测面。
+  state.issueHostToken('h1', 'a'.repeat(48), 1_000)
+  assert.deepEqual(state.counts(), { hosts: 1, clients: 1, conversations: 1, pendingPairs: 1, hostTokens: 1 })
   state.reset()
-  assert.deepEqual(state.counts(), { hosts: 0, clients: 0, conversations: 0, pendingPairs: 0 })
+  assert.deepEqual(state.counts(), { hosts: 0, clients: 0, conversations: 0, pendingPairs: 0, hostTokens: 0 })
 })
 
 // ── 重配（复核 🟡7）────────────────────────────────────────────────────

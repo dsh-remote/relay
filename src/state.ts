@@ -52,6 +52,39 @@ export interface PendingPair {
   used: boolean
 }
 
+/**
+ * 一枚**按主机**签发的 host token（2026-10-11 起，C 方案）。
+ *
+ * ## 为什么不再是"一个全局令牌 + 认领即轮换"
+ *
+ * 旧模型是：中继只认一枚令牌，而 `POST /api/claim-token` **轮换**它。于是
+ * **任何一台机器认领，都会把其他所有主机当场作废**；而主机`盘上有 token 就不再认领`，
+ * 所以被顶掉的那台**不会自愈**——它永远连不上。
+ *
+ * 2026-10-11 这天真实咬人：本机一天内被另外三台机器各顶掉一次（nginx 访问日志里
+ * 三个不同的公网 IP，UA 都是 `node` = 别的机器上的插件）。而这条接口是**无认证**的
+ * 公网接口 ⇒ 那个模型下，"任何能 POST 它的人都能把合法主机永久踢下线"。
+ *
+ * 现在按 `hostId` 一机一枚：认领只顶掉**这台机器自己**旧的那一枚
+ * （用户原话："后面的顶掉前面的"），别人的那一枚不受影响。
+ *
+ * ## 未绑定槽位
+ *
+ * `hostId === ''` 是**未绑定槽位**：3.1.2 及更早的插件认领时**不带 hostId**，
+ * 落到这里，语义与旧版逐字一致（认领即作废上一枚）。它保证老客户端不被这次改动打断，
+ * 同时把"互相顶掉"的影响**关在这个槽位里**——按 hostId 签发的那些令牌不受它影响。
+ */
+export interface HostTokenEntry {
+  token: string
+  /** 签发时刻（毫秒）。 */
+  issuedAt: number
+  /** 最后一次**成功鉴权**的时刻；`0` = 签出来还没人用过（用于诊断"签了没人用"）。 */
+  lastUsedAt: number
+}
+
+/** 未绑定槽位的键（见 `HostTokenEntry` 的注释）。 */
+export const UNBOUND_HOST_TOKEN_KEY = ''
+
 export interface Conversation {
   hostId: string
   /** 成员按 clientId 记账，因此客户端重连（同一 clientId）会自动重新挂上。 */
@@ -85,6 +118,8 @@ export class RelayState implements Clock {
   readonly clients = new Map<string, ClientEntry>()
   readonly pendingPairs = new Map<string, PendingPair>()
   readonly conversations = new Map<string, Conversation>()
+  /** 按 hostId 一机一枚（外加 `UNBOUND_HOST_TOKEN_KEY` 那个未绑定槽位）。 */
+  readonly hostTokens = new Map<string, HostTokenEntry>()
 
   /** 测试可注入固定时钟；默认用真实时间。 */
   private readonly clock: () => number
@@ -524,12 +559,80 @@ export class RelayState implements Clock {
   }
 
   /** 测试与诊断：把内部计数摊平成 `/healthz` 需要的形状。 */
-  counts(): { hosts: number; clients: number; conversations: number; pendingPairs: number } {
+  // ── host token（按 hostId 一机一枚，2026-10-11 起）────────────────────
+
+  /**
+   * 签发/覆盖 `hostId` 的令牌。**只动这一条**，别人那枚不受影响。
+   *
+   * `lastUsedAt` 归零：这一枚刚签出来还没被用来鉴权过。它只影响诊断与裁剪顺序
+   * （见 `pruneHostTokens`），不参与鉴权判定——鉴权只看 `token` 本身。
+   */
+  issueHostToken(hostId: string, token: string, now: number): HostTokenEntry {
+    const entry: HostTokenEntry = { token, issuedAt: now, lastUsedAt: 0 }
+    this.hostTokens.set(hostId, entry)
+    return entry
+  }
+
+  /** 记下"这枚令牌刚被用来**成功**鉴权"。没这一条时裁剪顺序就退化成"签得早的先丢"。 */
+  markHostTokenUsed(hostId: string, now: number): void {
+    const entry = this.hostTokens.get(hostId)
+    if (entry) entry.lastUsedAt = now
+  }
+
+  /**
+   * 令牌表有界：超出 `max` 时，按 `lastUsedAt || issuedAt` **从旧到新**丢。
+   *
+   * 为什么不是"按签发时刻丢最老"：一台一直在用的机器（签得早、但一直在用）会被
+   * 优先丢掉，而它**不会自愈**——下次它连上来只会拿到 `bad_token`，而它盘上有令牌
+   * 就不会重新认领。所以分两档：**没用过的先丢**，同一档里再按最近活动从旧到新。
+   *
+   * 返回丢掉几条（调用方去记一条 warn）。
+   */
+  pruneHostTokens(max: number): number {
+    // 防御纵深：`createRelay(config)` 是导出函数，测试与将来的嵌入方可以绕过
+    // `loadConfig` 直接构造配置。`max` 不是正整数时**不裁剪**——
+    // 曾写错成 `size <= max`（undefined）会把整张表删空，而那种"令牌全没了"
+    // 的表现是所有主机一起 `bad_token`，比不裁剪坏得多。
+    if (!Number.isFinite(max) || max <= 0) return 0
+    if (this.hostTokens.size <= max) return 0
+    /**
+     * 裁剪顺序 = **先丢"签出来还没人用过"的**，同一档里再按最近活动从旧到新。
+     *
+     * ⚠️ 不能只按 `lastUsedAt || issuedAt` 排序（第一版就是那么写的，写成即错）：
+     * 一台**一直在用**的老主机，它的 `lastUsedAt` 可能比"刚刚签发的占位条目"更早，
+     * 于是它会被优先丢掉——而它**不会自愈**（盘上有令牌就不再认领），
+     * 表现是"用得好好的主机突然永久连不上"，正是这次要修的那类故障。
+     * 两档排序保证：只要表里还有没用过的占位条目，**用过的一枚永远不会被丢**。
+     */
+    const order = [...this.hostTokens.entries()].sort((a, b) => {
+      const usedA = a[1].lastUsedAt > 0 ? 1 : 0
+      const usedB = b[1].lastUsedAt > 0 ? 1 : 0
+      if (usedA !== usedB) return usedA - usedB
+      return (a[1].lastUsedAt || a[1].issuedAt) - (b[1].lastUsedAt || b[1].issuedAt)
+    })
+    let dropped = 0
+    for (const [key] of order) {
+      if (this.hostTokens.size <= max) break
+      this.hostTokens.delete(key)
+      dropped += 1
+    }
+    return dropped
+  }
+
+  counts(): {
+    hosts: number
+    clients: number
+    conversations: number
+    pendingPairs: number
+    /** 令牌表条数（**只是条数**，绝不把令牌本身暴露到 `/healthz` 上）。 */
+    hostTokens: number
+  } {
     return {
       hosts: this.hosts.size,
       clients: this.clients.size,
       conversations: this.conversations.size,
       pendingPairs: this.pendingPairs.size,
+      hostTokens: this.hostTokens.size,
     }
   }
 
@@ -539,5 +642,6 @@ export class RelayState implements Clock {
     this.clients.clear()
     this.pendingPairs.clear()
     this.conversations.clear()
+    this.hostTokens.clear()
   }
 }

@@ -49,6 +49,23 @@ export interface RelayConfig {
    */
   pairStatusBudgetPerSec: number
   maxPendingPairs: number
+  /**
+   * 按 hostId 一机一枚的令牌表上限（2026-10-11 起）。
+   *
+   * 超出时按"最近用过"从旧到新丢（先丢没人用的占位条目，见 `RelayState.pruneHostTokens`）。
+   * 默认 500：一台中继服务的主机数是"人"的量级，而 500 条 × 约 120 字节 ≈ 60 KB。
+   */
+  maxHostTokens: number
+  /**
+   * 同一 IP 两次认领的最短间隔（毫秒），默认 4000。
+   *
+   * 为什么它是配置而不是常量：判据要能**确定性地**验"第二枚顶掉第一枚"，
+   * 而默认 4 秒的闸让测试要么等 4 秒、要么拿一个 429 的空 body 去比 undefined
+   * —— 后者正是 `claim-token.test.mjs` 旧版那条"轮换"判据**假绿**的原因
+   * （它比的是 `a.token !== b.token`，而 b 根本没有 token）。
+   * `0` = 关掉限频：那是给测试与"内网自用"的，运维在外网开这台中继时别设 0。
+   */
+  claimMinIntervalMs: number
   conversationIdleTtlMs: number
   /** 空会话（成员表一个客户端都不剩）回收时限：最后一个客户端离开起算。 */
   conversationEmptyTtlMs: number
@@ -134,7 +151,41 @@ const DECIMAL_INTEGER_RE = /^[0-9]+$/
  *    那个算力闸门取消掉，而启动时一声不吭。统一卡在 MAX_SAFE_INTEGER 就够——逐变量的
  *    业务上界是另一回事，不在配置层猜。
  */
-function integer(raw: string | undefined, fallback: number, name: string, problems: ConfigProblem[]): number {
+/**
+ * 认领限频间隔。**唯一一个允许 0 的旋钮**（0 = 关掉限频）。
+ *
+ * 为什么要单独一个函数：`integer()` 默认拒 0（见它的注释），而这里 0 有明确语义
+ * ——判据要能确定性地验"第二枚顶掉第一枚"，不能靠"等 4 秒"绕过闸。
+ * ⚠️ 但关掉它必须**留痕**：`/api/claim-token` 是**无认证**的公网接口，
+ * 关掉限频之后"脚本连打"就没人挡了。
+ */
+function claimMinIntervalMs(env: Record<string, string | undefined>, problems: ConfigProblem[]): number {
+  const value = integer(env.DRC_CLAIM_MIN_INTERVAL_MS, 4_000, 'DRC_CLAIM_MIN_INTERVAL_MS', problems, {
+    allowZero: true,
+  })
+  if (value === 0) {
+    problems.push({
+      level: 'warn',
+      message:
+        'DRC_CLAIM_MIN_INTERVAL_MS=0：认领接口的限频**已关闭**（同 IP 可以无限连打）。' +
+        '只在测试或完全内网自用时这么设；公网上的这台中继请留 4000。',
+    })
+  }
+  return value
+}
+
+function integer(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  problems: ConfigProblem[],
+  /**
+   * 允许显式写 `0`。**默认不允许**——绝大多数旋钮的 0 都是"配置写错了"，
+   * 而那些值一旦被 0 悄悄地"关掉"（配额、超时、并发），表现是故障而不是报错。
+   * 只有"0 有明确语义"的旋钮才打开它，并且调用方要自己补一条 warn 留痕。
+   */
+  options: { allowZero?: boolean } = {},
+): number {
   if (raw === undefined) return fallback
   if (raw === '') {
     problems.push({
@@ -148,8 +199,9 @@ function integer(raw: string | undefined, fallback: number, name: string, proble
     return fallback
   }
   const n = Number(raw.trim())
-  if (!Number.isSafeInteger(n) || n <= 0) {
-    problems.push({ level: 'error', message: `${name} 必须是正整数，收到 ${JSON.stringify(raw)}` })
+  if (!Number.isSafeInteger(n) || n < 0 || (n === 0 && options.allowZero !== true)) {
+    const shape = options.allowZero === true ? '非负整数' : '正整数'
+    problems.push({ level: 'error', message: `${name} 必须是${shape}，收到 ${JSON.stringify(raw)}` })
     return fallback
   }
   return n
@@ -265,6 +317,8 @@ export function loadConfig(
     pairGlobalBudgetPerSec: integer(env.DRC_PAIR_GLOBAL_PER_SEC, 20, 'DRC_PAIR_GLOBAL_PER_SEC', problems),
     pairStatusBudgetPerSec: integer(env.DRC_PAIR_STATUS_PER_SEC, 5, 'DRC_PAIR_STATUS_PER_SEC', problems),
     maxPendingPairs: integer(env.DRC_MAX_PENDING_PAIRS, 1000, 'DRC_MAX_PENDING_PAIRS', problems),
+    maxHostTokens: integer(env.DRC_MAX_HOST_TOKENS, 500, 'DRC_MAX_HOST_TOKENS', problems),
+    claimMinIntervalMs: claimMinIntervalMs(env, problems),
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS', problems),
     // P2-⑤（2026-10-04 用户拍板 30 分钟）：远小于 7 天的空闲 TTL。
     // 删的代价是手机再扫一次码；不删的代价是 conversations 计数虚高、排障对不上。

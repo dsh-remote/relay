@@ -43,7 +43,7 @@ import type { RelayConfig } from './config.js'
 import { BackpressureGate, Budget, FrameRateGate } from './limits.js'
 import { Log, REDACTED } from './log.js'
 import { restoreState, snapshotState, writeStateFile } from './persist.js'
-import { RelayState, WS_OPEN, type Sock } from './state.js'
+import { RelayState, UNBOUND_HOST_TOKEN_KEY, WS_OPEN, type Sock } from './state.js'
 
 /** 保留的自定义关闭码：同 hostId 顶号。客户端的重连策略不认识它，只对主机有意义。 */
 const CLOSE_REPLACED = 4000
@@ -160,16 +160,19 @@ function tokenMatches(expected: string, got: string): boolean {
   return timingSafeEqual(a, b)
 }
 
-/**
- * 同一 IP 两次认领的最短间隔（毫秒）。
- *
- * 4000 = 每人每分钟最多 15 枚。它挡的是"脚本连打"与误触重复点击；
- * ⚠️ **挡不住换源 IP 的分布式刷** —— 那要在运维侧解决（这台中继给谁用）。
- */
-const CLAIM_MIN_INTERVAL_MS = 4_000
-
 /** 认领限频表的容量上限：满了就丢最旧的一批（`Map` 保持插入顺序）。 */
 const CLAIM_TRACK_MAX = 10_000
+
+/**
+ * 认领时 `hostId` 的形状与上限。
+ *
+ * 为什么要在门口卡：`hostId` 会变成令牌表的**键**，也会被写进状态文件；
+ * 字符集限制成 URL 安全的那几个是为了排障时能直接贴进日志与 `curl`。
+ * 与 `persist.ts` 的 `MAX_HOST_ID_LEN` **必须一致**——两处口径不同会让
+ * "落盘后被静默丢掉"变成一台主机永久连不上。
+ */
+const MAX_HOST_ID_LEN = 200
+const HOST_ID_RE = /^[A-Za-z0-9._:-]+$/
 
 export function createRelay(config: RelayConfig): RelayHandle {
   const log = new Log(config.logLevel)
@@ -180,14 +183,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const pairStatusBudget = new Budget(config.pairStatusBudgetPerSec)
   const peers = new WeakMap<WebSocket, Peer>()
   let shuttingDown = false
-  /**
-   * **当前有效的 host token**（2026-10-11 起可变）。
-   *
-   * 之前是直接读 `config.hostToken`（只读），所以「随时换 token」没有出口。
-   * 现在认领接口轮换的是这一份，而 `config.hostToken` 仍作为**启动初值** ——
-   * 于是重启后若没人认领，新进程会回到 env 里那枚（运维改 env 的老路仍然有效）。
-   */
-  let currentHostToken = config.hostToken
   /** 认领限频表：IP → 上次认领时刻。有界（见下方裁剪），不是无限增长的字典。 */
   const lastClaimAt = new Map<string, number>()
   let sweepTimer: NodeJS.Timeout | undefined
@@ -197,24 +192,62 @@ export function createRelay(config: RelayConfig): RelayHandle {
   let lastCountersAt = 0
 
   /**
-   * 轮换 host token：**旧的那枚立刻失效**。
+   * 签一枚新的 host token。
    *
-   * 长度与 env 里那枚一致（48 十六进制字符）—— `tokenMatches` 是定长比较，
-   * 长度变了不会报错、只会让所有已装机的主机**静默**连不上，所以这里必须对齐。
-   * 长度口径取自 `docs/RELEASE.md` 里那句「`openssl rand -hex 24`」。
+   * 长度 48 位十六进制 —— 与 env 那枚的口径一致（`openssl rand -hex 24`）。
+   * `tokenMatches` 是**定长比较**：长度变了不会报错、只会让已装机的主机静默连不上，
+   * 所以这里必须对齐 `HOST_TOKEN_RE`（`persist.ts` 读盘时按同一个正则筛）。
    */
-  function rotateHostToken(): string {
-    currentHostToken = randomBytes(24).toString('hex')
-    if (lastClaimAt.size >= CLAIM_TRACK_MAX) {
-      // `Map` 按插入顺序迭代 ⇒ 丢最老的一批就是先到的那些
-      const drop = lastClaimAt.size - CLAIM_TRACK_MAX + 1
-      let i = 0
-      for (const key of lastClaimAt.keys()) {
-        lastClaimAt.delete(key)
-        if (++i >= drop) break
-      }
+  function newHostToken(): string {
+    return randomBytes(24).toString('hex')
+  }
+
+  /**
+   * 认领限频表的裁剪（满了丢最老的 1 条）。
+   *
+   * ⚠️ 它挡不住"换源 IP 的分布式刷" —— 那要在运维侧解决（这台中继给谁用）。
+   */
+  function rememberClaim(ip: string, now: number): void {
+    lastClaimAt.set(ip, now)
+    if (lastClaimAt.size <= CLAIM_TRACK_MAX) return
+    // `Map` 按插入顺序迭代 ⇒ 丢最老的一批就是先到的那些
+    const drop = lastClaimAt.size - CLAIM_TRACK_MAX
+    let i = 0
+    for (const key of lastClaimAt.keys()) {
+      lastClaimAt.delete(key)
+      if (++i >= drop) break
     }
-    return currentHostToken
+  }
+
+  /**
+   * 这枚令牌能不能代表 `hostId` 连上来。
+   *
+   * 三条来源，任一命中即可（全是定长比较，别把长度或时序泄露出去）：
+   *
+   * ① **该 hostId 自己那枚** —— `POST /api/claim-token` 领来的（2026-10-11 起的模型）。
+   * ② **未绑定槽位**那枚 —— 3.1.2 及更早的插件认领时不带 hostId，落在那里；
+   *    它保持"对谁都算数"的旧语义，**但认领它再也动不了 ①**，于是老客户端互相顶掉时
+   *    新客户端不受影响。
+   * ③ **env 里的 `DRC_HOST_TOKEN`** —— 运维引导凭据。它**永不参与轮换**，所以
+   *    "任何陌生人 POST 一次就能把合法主机永久踢下线"这条没了。
+   *
+   * 成功时打一个"刚用过"的时间戳：裁剪令牌表时按它排序，先丢的永远是没人用的占位条目
+   * （签得早但一直在用的机器不该被丢，丢了它**不会自愈**）。
+   */
+  function hostTokenAccepted(hostId: string, got: string | undefined): boolean {
+    if (!got) return false
+    const now = Date.now()
+    const perHost = state.hostTokens.get(hostId)
+    if (perHost && tokenMatches(perHost.token, got)) {
+      state.markHostTokenUsed(hostId, now)
+      return true
+    }
+    const unbound = state.hostTokens.get(UNBOUND_HOST_TOKEN_KEY)
+    if (unbound && tokenMatches(unbound.token, got)) {
+      state.markHostTokenUsed(UNBOUND_HOST_TOKEN_KEY, now)
+      return true
+    }
+    return config.hostToken !== '' && tokenMatches(config.hostToken, got)
   }
 
   // ── 会话表落盘（HANDOFF §1.1 方案 A，DRC_STATE_FILE 未设时整段是死代码）──
@@ -580,12 +613,14 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
     peer.protocol = frame.protocol
     if (frame.role === 'host') {
-      if (!currentHostToken) {
+      // hostId 要**先**算出来：按 hostId 一机一枚之后，它是查令牌的键。
+      const hostId = frame.hostId?.trim() || newHostId()
+      if (!config.hostToken && state.hostTokens.size === 0) {
         sendError(peer, 'internal', 'relay has no host token configured')
         peer.ws.close(1011)
         return
       }
-      if (!frame.token || !tokenMatches(currentHostToken, frame.token)) {
+      if (!hostTokenAccepted(hostId, frame.token)) {
         peer.authAttempts += 1
         // 只记"第几次失败"，绝不记token 的任何片段。
         log.warn('host auth failed', { attempts: peer.authAttempts })
@@ -593,7 +628,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
         if (peer.authAttempts >= config.maxHostAuthAttempts) peer.ws.close(4001, 'too_many_auth_attempts')
         return
       }
-      const hostId = frame.hostId?.trim() || newHostId()
       releaseIdentityFor(peer, { role: 'host', id: hostId })
       const { replaced } = state.attachHost(hostId, peer.ws, frame.label ?? '')
       peer.role = 'host'
@@ -1391,6 +1425,119 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 2. 整段 try/catch：真出现别的畸形（例如 absolute-form 里带坏 host 的 req.url）
    *    也只回 500，进程继续服务。
    */
+  /**
+   * 读一个**有上限**的请求体。
+   *
+   * 上限不是可选项：这是**无认证**接口，不限的话一个陌生人一次 POST 就能把内存喂满。
+   * 超限立刻回 413 并 `destroy()`（不断开的话对方可以一直往里灌）。
+   * 空体是合法的（3.1.2 的插件就不带体），返回 `''`。
+   */
+  function readBody(req: IncomingMessage, limit: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = []
+      let size = 0
+      req.on('data', (chunk: Buffer) => {
+        size += chunk.length
+        if (size > limit) {
+          reject(new Error('body_too_large'))
+          req.destroy()
+          return
+        }
+        chunks.push(chunk)
+      })
+      req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+      req.on('error', reject)
+    })
+  }
+
+  /** 认领请求体的上限：`{hostId, token}` 两三个字段，1024 字节绰绰有余。 */
+  const CLAIM_BODY_MAX_BYTES = 1024
+
+  /**
+   * `POST /api/claim-token` —— 领一枚 host token。
+   *
+   * ## 带 `hostId` 与不带，是**两条不同的语义**（2026-10-11 起）
+   *
+   * - **带** `{hostId}`：给这一台机器签一枚，**只顶掉它自己旧的那一枚**
+   *   （`state.issueHostToken`）。这就是"后面的顶掉前面的"——而别的主机那枚不受影响。
+   * - **不带**（3.1.2 及更早的插件）：落到**未绑定槽位**，语义与旧版逐字一致
+   *   （认领即作废上一枚）。老客户端因此不会因为这次改动被打断，而它顶掉的也只是
+   *   同一个槽位里的那枚——按 hostId 签发的令牌不受影响。
+   *
+   * ## 三道闸（沿用旧版，一道都没减）
+   *
+   * 只收 POST / 停机中不受理 / 同 IP 限频 4 秒。**任何人都能领一枚**这条没变：
+   * 这台中继会替陌生人中继流量（读不到内容，载荷密封），总量控制在运维侧。
+   * 但**"随便 POST 一次就把合法主机永久踢下线"这条没有了**：认领动不了 env 那枚，
+   * 也动不了别人的 hostId 那枚。
+   */
+  async function handleClaimToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      res.statusCode = 405
+      res.end(JSON.stringify({ error: 'use POST' }))
+      return
+    }
+    if (shuttingDown) {
+      res.statusCode = 503
+      res.end(JSON.stringify({ error: 'shutting_down' }))
+      return
+    }
+    const now = Date.now()
+    // 限频：同一 IP 两次认领至少隔 CLAIM_MIN_INTERVAL_MS。
+    // ⚠️ 这挡不住分布式刷（换源 IP），它只挡"脚本连打"这一种。
+    // 真正的总量控制在运维侧（谁在用这台中继、要不要开认领）。
+    // ⚠️ 打点在**读体之前**：读体是异步的，两个并发请求会一起穿过那道判断。
+    const ip = req.socket.remoteAddress ?? 'unknown'
+    const last = lastClaimAt.get(ip) ?? 0
+    // 4000（默认）= 每人每分钟最多 15 枚。它挡的是"脚本连打"与误触重复点击；
+    // ⚠️ **挡不住换源 IP 的分布式刷** —— 那要在运维侧解决（这台中继给谁用）。
+    // 值来自配置：`DRC_CLAIM_MIN_INTERVAL_MS=0` 表示关掉（测试与内网自用）。
+    if (now - last < config.claimMinIntervalMs) {
+      res.statusCode = 429
+      res.end(JSON.stringify({ error: 'too_soon', retryAfterMs: config.claimMinIntervalMs - (now - last) }))
+      return
+    }
+    rememberClaim(ip, now)
+
+    let body: Record<string, unknown> = {}
+    const raw = await readBody(req, CLAIM_BODY_MAX_BYTES)
+    if (raw.trim() !== '') {
+      try {
+        const parsed: unknown = JSON.parse(raw)
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          body = parsed as Record<string, unknown>
+        }
+      } catch {
+        // 体不是 JSON：按"没带 hostId"处理（老客户端可能带着别的东西）。
+        // 不报 400 —— 一条宽松的兼容路径比一个 400 更能保住老装机。
+      }
+    }
+    const rawHostId = typeof body.hostId === 'string' ? body.hostId.trim() : ''
+    if (rawHostId !== '' && (rawHostId.length > MAX_HOST_ID_LEN || !HOST_ID_RE.test(rawHostId))) {
+      res.statusCode = 400
+      res.end(
+        JSON.stringify({ error: 'bad_host_id', hint: `hostId 最多 ${MAX_HOST_ID_LEN} 字符，只允许字母数字与 ._:-` }),
+      )
+      return
+    }
+
+    const slot = rawHostId === '' ? UNBOUND_HOST_TOKEN_KEY : rawHostId
+    const token = newHostToken()
+    state.issueHostToken(slot, token, now)
+    // 令牌表有界：超出就按"最近用过"从旧到新丢（先丢没人用的占位条目）。
+    const pruned = state.pruneHostTokens(config.maxHostTokens)
+    if (pruned > 0) log.warn('host tokens pruned', { dropped: pruned, kept: state.hostTokens.size })
+    // 结构性变更 ⇒ 立刻落盘（与建/删会话同一条纪律）：不落盘的话中继一重启，
+    // 这些令牌就全没了，而主机侧"盘上有 token 就不再认领"⇒ 它们会被永久搁死。
+    markStateChanged()
+    log.info(rawHostId === '' ? 'host token claimed (unbound)' : 'host token claimed', {
+      ip,
+      hostId: rawHostId,
+      hostTokens: state.hostTokens.size,
+    })
+    res.end(JSON.stringify({ token, hostId: rawHostId, rotatedAt: new Date(now).toISOString() }))
+  }
+
   function httpHandler(req: IncomingMessage, res: ServerResponse): void {
     try {
       const url = new URL(req.url ?? '/', 'http://relay.invalid')
@@ -1406,9 +1553,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
         return
       }
       /**
-       * **认领一枚 host token**（2026-10-11）。
+       * **认领一枚 host token**。
        *
-       * ## 它为什么存在
+       * ## 它为什么存在（2026-10-11 起）
        *
        * 目标形态是「装完就能用」：用户 `npm i` 之后**什么都不用配**。
        * 而 token 是主机与中继之间的共享密钥 —— 之前只能由用户把它写进
@@ -1422,44 +1569,38 @@ export function createRelay(config: RelayConfig): RelayHandle {
        * 把条目改写成自己的 —— 用户扫的是 A 的码、配到的是 B，而两边都不报错
        * （见 `src/state.ts` 里关于共享 token 的那段注释）。
        *
-       * ⇒ 所以这里是**认领**而不是**索取**：领到的是**一枚新的、只属于这一台机器的**
-       * token，且旧的那枚**立刻作废**。攻击者能领到自己的那枚（那本来就是给他用的），
-       * **拿不到你的**。
+       * ⇒ 所以这里是**认领**而不是**索取**：领到的是**一枚新签的** token。
+       * 攻击者能领到自己的那枚（那本来就是给他用的），**拿不到你的**。
        *
-       * ## 滥用面（这是这条接口的真实成本，必须写明）
+       * ## ⚠️ 2026-10-11 改了什么（这一段是被一次真实事故逼出来的）
+       *
+       * 旧模型是「**全局单令牌 + 认领即轮换**」：任何一台机器认领，
+       * 都会把**所有**主机的令牌当场作废。而主机侧"盘上有 token 就不再认领"
+       * ⇒ 被顶掉的那台**不会自愈**、永久连不上。
+       * 那一天本机被另外三台机器各顶掉一次（nginx 访问日志里三个公网 IP，
+       * UA 都是 `node`），而这条接口是**无认证**的 ⇒ 那个模型下
+       * "任何能 POST 它的人都能把合法主机永久踢下线"。
+       *
+       * 现在：带 `{hostId}` 认领只顶掉**这台机器自己**旧的那一枚；不带 hostId
+       * （3.1.2 及更早）落到未绑定槽位、语义不变；env 那枚**永不参与轮换**。
+       * 细节见 `handleClaimToken` 与 `state.ts` 的 `HostTokenEntry`。
+       *
+       * ## 滥用面（这条接口的真实成本，必须写明）
        *
        * 任何人都能领一枚 ⇒ 这台中继会**替陌生人中继流量**。他们读不到别人的内容
        * （载荷密封、中继零知识），但能消耗带宽与配对表容量。
-       * ⇒ 下面三道闸是给它加的，不是装饰：限频、每次认领**作废上一枚**、
-       * 停机中不受理。
+       * ⇒ 三道闸是给它加的，不是装饰：限频、停机中不受理、令牌表有界。
        */
       if (url.pathname === '/api/claim-token') {
-        if (req.method !== 'POST') {
-          res.statusCode = 405
-          res.end(JSON.stringify({ error: 'use POST' }))
-          return
-        }
-        if (shuttingDown) {
-          res.statusCode = 503
-          res.end(JSON.stringify({ error: 'shutting_down' }))
-          return
-        }
-        const now = Date.now()
-        // 限频：同一 IP 两次认领至少隔 CLAIM_MIN_INTERVAL_MS。
-        // ⚠️ 这挡不住分布式刷（换源 IP），它只挡"脚本连打"这一种。
-        // 真正的总量控制在运维侧（谁在用这台中继、要不要开认领）。
-        const ip = req.socket.remoteAddress ?? 'unknown'
-        const last = lastClaimAt.get(ip) ?? 0
-        if (now - last < CLAIM_MIN_INTERVAL_MS) {
-          res.statusCode = 429
-          res.end(JSON.stringify({ error: 'too_soon', retryAfterMs: CLAIM_MIN_INTERVAL_MS - (now - last) }))
-          return
-        }
-        lastClaimAt.set(ip, now)
-        // 认领即轮换：老的那枚立刻不再有效 ⇒「随时换 token」不需要另开接口。
-        const token = rotateHostToken()
-        log.info('host token claimed', { ip })
-        res.end(JSON.stringify({ token, rotatedAt: new Date(now).toISOString() }))
+        // 这条要读请求体（`{hostId}`），所以是异步的；异常一律在这里收干净，
+        // 绝不让它冒到进程（与 httpHandler 同一条纪律，P0-1）。
+        void handleClaimToken(req, res).catch((e: unknown) => {
+          log.warn('claim handler failed', { error: String(e) })
+          if (!res.headersSent) {
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: 'internal' }))
+          }
+        })
         return
       }
       if (url.pathname === '/api/info') {
