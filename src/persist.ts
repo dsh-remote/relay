@@ -234,18 +234,35 @@ export function readStateFile(path: string, log: Log): PersistedState | undefine
     return undefined
   }
   const file = parsed as Record<string, unknown>
-  if (file.version !== STATE_FILE_VERSION) {
-    // 往前兼容不了、往后兼容也不猜：只在文件是我们自己写的那个版本时才读。
-    log.warn('state file version mismatch, starting empty', { path, found: String(file.version) })
-    return undefined
-  }
-
+  /**
+   * ⚠️ **不按 `version` 数字拒收**（2026-10-12 生产事故后改）。
+   *
+   * ## 原来这里有一道版本闸，它是错的
+   *
+   * v2 把 `hostTokens` 从"可选"改成"必需"（类型层面），读路径便加了一句
+   * `if (file.version !== STATE_FILE_VERSION) return undefined`。
+   * 听着严谨，实际后果：**3.1.3 写出的盘上文件与新格式逐字段相同**
+   * （`hostTokens` 从 3.1.3 起就在写，形状一点没变），却因为 `version: 1`
+   * 被整份丢掉 —— 10 枚 host token、3 条配对会话当场清零，随后落盘又被空状态覆盖。
+   * 生产上就是这样红过的：
+   *   {"level":"warn","msg":"state file version mismatch, starting empty","found":"1"}
+   *
+   * ## 为什么"数字对不上"不等于"读不了"
+   *
+   * 版本号是**我们写出的标记**，不是格式的证明。真正能判断"读得懂读不懂"的是**形状**：
+   * `conversations` 逐条过 schema、`hostTokens` 必须是数组 —— 两道闸都在下面，
+   * 坏了丢那一条并留痕。
+   *
+   * ⇒ 数字只决定我们**写出**什么；读的一侧认形状。将来真改了形状
+   * （例如 `hostTokens` 变成对象表），形状闸会拒，且拒得有痕迹 ——
+   * 比一个"看起来严密、其实把一模一样的数据丢掉"的数字闸可靠。
+   */
   const { conversations, dropped } = sanitize(file.conversations)
   if (dropped > 0) log.warn('state file entries dropped', { path, dropped, kept: conversations.length })
   /**
-   * ⚠️ `hostTokens` 是**必需字段**（v2 起）：没有它就说明这份文件不是这一版写的
-   * —— 而版本闸在上面已经把它拦掉了。不再有"老文件没有这个键 ⇒ 当空表"那条路：
-   * 那等于让一台老中继写下的文件悄悄把所有人的令牌清空。
+   * `hostTokens` 是**必需字段**：没有它（或不是数组）就不读 ——
+   * 那意味着这份文件不是能安全继承的一份（老中继写的、被人改坏的），
+   * 而不是"版本旧一点所以让一步"。缺它时当空表并留痕，绝不默默继承一份读不懂的状态。
    */
   if (!Array.isArray(file.hostTokens)) {
     log.warn('state file has no hostTokens array, starting empty', { path })

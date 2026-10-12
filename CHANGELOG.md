@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.1.5
+
+> 四个包一起 bump 到 `3.1.5`。**本版代码无变化** —— 这一版是为了把小程序（`@dsh-remote/client`）
+> 的审核整改版发出去，而四个包的版本号按口径必须同一个号（`scripts/next-version.mjs --check`）。
+> 具体整改见 `packages/client/CHANGELOG.md` 的 3.1.5 一节。
+>
+> ⇒ 若本轮只发小程序：**不需要**给本包打 tag / 发 npm（npm 上仍是 3.1.4）。
+
 ## 3.1.4
 
 > 四个包一起 bump 到 `3.1.4`。**主题：把"向后兼容"整条清掉**（用户裁决：没有真实用户）。
@@ -9,12 +17,17 @@
 - **观测面收敛**：`/healthz` 删掉 `protocolMin` / `peerProtocolMin` / `peerProtocolMax` /
   `peersNoProtocol` 四个字段，以及支撑它们的整套按连接计数（`Peer.protocol` /
   `countedProtocol` 闩锁）。单版本制下"对端版本分布"不存在 —— 只留 `protocolSelf`。
-- **落盘格式升 v2**：`state.json` 的 `hostTokens` 从"可选、老文件当空表"变成**必需字段**；
-  v1 文件不再有读路径（读到没有该数组的文件当空表并留一行 warn）。
+- **落盘格式升 v2**：`hostTokens` 从"可选、老文件当空表"变成**必需字段**，`snapshotState`
+  恒写它；缺这个数组（或不是数组）的盘上文件**整份不继承**，按空表起并留痕。
+- ⚠️ **读路径不按 `version` 数字拒收**（3.1.4 部署当场红过之后改）：v2 与 3.1.3 写出的文件
+  **逐字段相同**（`hostTokens` 从 3.1.3 起就在写），而原先那道
+  `file.version !== STATE_FILE_VERSION ⇒ 不读` 会让升级那一刻把 10 枚令牌、3 条配对会话
+  清零、并**立刻被空状态覆盖**。版本号是**写出的标记**，读的一侧认**形状**。
 - `relay-doctor` 的白名单与报告文案跟着收敛（原来会读那四个已删字段）。
 - 判据：`handshake.test.mjs` 的"老端点照常连上"翻成"**没报版本一律拒**"；删掉三条
   `peerProtocols` 观测面判据；`relay.test.mjs` 里写死 `version: 1` 的那条改成读
-  `STATE_FILE_VERSION`（升格式不该红在无关的地方）。
+  `STATE_FILE_VERSION`；`persist.test.mjs` 新增 **"盘上文件只认形状、不认版本号"**
+  的回归判据（3.1.3 写的那份必须读得进来 —— 这次生产事故的直接产物）。
 
 ## 3.1.3
 

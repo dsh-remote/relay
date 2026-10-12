@@ -356,13 +356,25 @@ test('验收 4：状态文件损坏时中继照常起来，日志说清，并按
   }
 })
 
-test('验收 4b：版本不认识 / 顶层形状坏 → 一律按空，不猜字段', () => {
+test('验收 4b：顶层形状坏 → 一律按空，不猜字段', () => {
   const dir = tmpDir()
   try {
     for (const [name, body] of [
-      ['version.json', JSON.stringify({ version: 99, savedAt: 1, conversations: [] })],
+      // 顶层不是对象 / 是数组
       ['shape.json', JSON.stringify([1, 2, 3])],
+      // conversations 整个不是数组 ⇒ 一条都读不出来
       ['nested.json', JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 1, conversations: 'nope' })],
+      // 缺 hostTokens（或不是数组）⇒ 整份不可继承
+      ['notokens.json', JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 1, conversations: [] })],
+      [
+        'badtokens.json',
+        JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 1, conversations: [], hostTokens: {} }),
+      ],
+      // savedAt 不是时间戳 ⇒ 当 0，不猜
+      [
+        'savedat.json',
+        JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 'soon', conversations: [], hostTokens: [] }),
+      ],
     ]) {
       const p = join(dir, name)
       writeFileSync(p, body)
@@ -370,6 +382,52 @@ test('验收 4b：版本不认识 / 顶层形状坏 → 一律按空，不猜字
       assert.equal(restoreState(p, new RelayState(), cap.log, 1000), 0, name)
       assert.ok(cap.messages.length > 0, `${name} 应当留痕`)
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * ⚠️⚠️ **这条判据是 2026-10-12 那次生产事故的直接产物，别删。**
+ *
+ * ## 事故
+ *
+ * v2 给读路径加过一道 `file.version !== STATE_FILE_VERSION ⇒ 整份不读"。
+ * 听起来严谨，而 3.1.3 写出的盘上文件与新格式**逐字段相同**（`hostTokens` 从 3.1.3
+ * 起就在写），于是升级到 3.1.4 的那一刻：
+ *   - 10 枚 host token、3 条配对会话清零（`hostTokens=0 conversations=0`）；
+ *   - 空状态**立刻落盘**，把原文件覆盖掉（备份之外就没有了）；
+ *   - 所有主机的握手变成 `host auth failed`，只能等插件自愈重新认领。
+ * 日志里只有一行 `state file version mismatch, starting empty found:"1"`。
+ *
+ * ## 判据钉住的口径
+ *
+ * 版本号是**写出的标记**，不是格式的证明；读的一侧认**形状**。
+ * ⇒ 一份 `version: 1`（3.1.3 写的）但形状完全对得上的文件，必须被读进来。
+ */
+test('盘上文件只认形状，不认版本号：3.1.3 写的那份必须能读（v1 数字不是拒收理由）', () => {
+  const dir = tmpDir()
+  try {
+    const p = join(dir, 'state.json')
+    // 逐字段照 3.1.3 的写出形状：version 是 1，hostTokens 已经在写了。
+    writeFileSync(
+      p,
+      JSON.stringify({
+        version: 1,
+        savedAt: 1_700_000_000_000,
+        conversations: [],
+        hostTokens: [{ hostId: 'drc-748e9a9ce167', token: 'a'.repeat(48), issuedAt: 1, lastUsedAt: 2 }],
+      }),
+    )
+    const cap = captureLog()
+    const state = new RelayState()
+    assert.equal(restoreState(p, state, cap.log, 1000), 0, '3.1.3 那份没有会话，但令牌必须读进来')
+    assert.equal(state.hostTokens.size, 1, `令牌没读进来：${cap.messages.join(' | ')}`)
+    assert.ok(state.hostTokens.has('drc-748e9a9ce167'), '按 hostId 的那枚必须原地回来')
+
+    // 反向：写出的一侧仍然是当前版本（读认形状 ≠ 写也跟着降级）
+    writeStateFile(p, snapshotState(state, 1), cap.log)
+    assert.equal(JSON.parse(readFileSync(p, 'utf8')).version, STATE_FILE_VERSION, '写出必须是当前版本')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
