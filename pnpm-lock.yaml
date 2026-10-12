@@ -351,15 +351,15 @@ packages:
       utf-8-validate:
         optional: true
 
-  zod@4.6.6:
-    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
+  zod@4.6.5:
+    resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
 
 snapshots:
 
   '@dsh-remote/protocol@3.1.4':
     dependencies:
       tweetnacl: 1.0.3
-      zod: 4.6.6
+      zod: 4.6.5
 
   '@esbuild/aix-ppc64@0.28.2':
     optional: true
@@ -567,4 +567,4 @@ snapshots:
 
   ws@8.22.0: {}
 
-  zod@4.6.6: {}
+  zod@4.6.5: {}
