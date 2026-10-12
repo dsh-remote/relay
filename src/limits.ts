@@ -102,7 +102,7 @@ export const HOST_SLOW_CONSUMER_MS = 10_000
  * 背压窗口（客户端）：**必须严格大于对端自己的重连周期**，否则中继就成了一台
  * "永远在踢、手机永远在重连"的循环发动机。
  *
- * 推导（常量取自 `mp/core/socket.js`，本文件不复制它们的值，只在这里写算式）：
+ * 推导（常量取自 `packages/client/core/socket.js`，本文件不复制它们的值，只在这里写算式）：
  *   CONNECT_TIMEOUT_MS(12s) + RECONNECT_MAX_MS(30s) + 抖动上限(0.5s) ≈ 42.5s → 取 45s
  * 为什么是这一串：手机被踢后 `onClose` 不读关闭码，`onOpen` 又把退避重置为 0，
  * 所以它最快 ~1s 就回来；只有把窗口放到"对端连一次带退避的完整周期"之外，

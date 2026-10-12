@@ -55,13 +55,19 @@ import type { Log } from './log.js'
 import type { Conversation, RelayState } from './state.js'
 
 /**
- * 落盘格式版本。**不认识就整份按空处理**（而不是尽力解析）——猜错字段的读法会把
- * 一份好状态读成坏状态，那种"看起来起来了、其实是空表"的故障比直接报错难查得多。
+ * 落盘格式版本 —— **只决定我们写出什么**，读的一侧不认它。
  *
- * ⚠️ `2`（2026-10-11 晚）：`hostTokens` 从"可选、老文件当空表"变成**必需字段**。
- * 没有老用户，所以**不为 v1 文件保留任何读取路径** —— 旧文件一律读成空表并留一条 warn
- * （配对要重新扫，令牌要重新认领）。升版本的代价只是"升级后第一次启动是空的"，
- * 而留着 v1 分支的代价是永远要维护两种格式 + 一条"老文件静默清空令牌"的路。
+ * ⚠️ 2026-10-12 生产事故后改的口径（原来这里写的规则正好相反，是错的）：
+ * 这里曾经还有一句"**不认识就整份按空处理**，不为 v1 保留任何读取路径"，
+ * 听着严谨，后果是 3.1.3 写出的盘上文件（形状与 v2 **逐字段相同**）在升级那一刻
+ * 被整份丢掉：10 枚令牌、3 条配对会话清零，随后空状态还覆盖了盘上文件。
+ * 完整的事故与为什么改成"认形状"见 `readStateFile` 里那段注释。
+ *
+ * ⇒ `version` 是**我们写出的标记**；判断"读得懂读不懂"的是**形状**
+ * （`conversations` 逐条过 schema、`hostTokens` 必须是数组）。将来真改了形状，
+ * 形状闸会拒，且拒得有痕迹 —— 比一个数字闸可靠。
+ *
+ * `2` 的含义：`hostTokens` 从"可选"变成**必需字段**（缺它就整份不继承，见读路径）。
  */
 export const STATE_FILE_VERSION = 2
 
@@ -154,8 +160,8 @@ function isTimestamp(value: unknown): value is number {
  *
  * **刻意不是"一条坏就整份作废"**：一份 10 MB 的状态里坏掉 1 行，代价不该是全部手机
  * 重新扫码。逐条丢弃并报出条数，运维一眼能看出是"文件被截断"还是"手改坏了某一行"。
- * 而 `version` / JSON 语法 / 顶层形状这三处是整份作废——它们坏掉意味着我们对这份
- * 文件的理解本身就不成立。
+ * 而 JSON 语法 / 顶层形状 / `hostTokens` 缺失这三处是整份作废——它们坏掉意味着我们对
+ * 这份文件的理解本身就不成立。（`version` 数字**不作判据**，见 `readStateFile`。）
  */
 function sanitize(raw: unknown): { conversations: PersistedConversation[]; dropped: number } {
   if (!Array.isArray(raw)) return { conversations: [], dropped: 0 }
@@ -206,8 +212,9 @@ function sanitize(raw: unknown): { conversations: PersistedConversation[]; dropp
 /**
  * 读回状态文件。
  *
- * 返回 `undefined` = 没有可用状态（文件不存在 / 读不了 / 语法坏 / 版本不认识），
- * 调用方按空表启动。**任何一种失败都不抛**——理由见文件头纪律第 2 条。
+ * 返回 `undefined` = 没有可用状态（文件不存在 / 读不了 / JSON 语法坏 / 顶层形状坏 /
+ * `hostTokens` 缺失或不是数组），调用方按空表启动。**任何一种失败都不抛**——
+ * 理由见文件头纪律第 2 条。⚠️ 版本号**不在**这个列表里，见下面那段。
  */
 export function readStateFile(path: string, log: Log): PersistedState | undefined {
   let text: string

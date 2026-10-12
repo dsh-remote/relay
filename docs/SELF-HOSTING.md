@@ -744,6 +744,19 @@ v3 为此把停机做成了**可显式调用的出口**（`src/lifecycle.ts`）�
 
 ## 10. 升级
 
+**两条路，按你部署时选的那条走**（我们的生产实例走的是容器；两条别同时开）。
+
+**① 容器**（`deploy/docker/compose.yaml`，2026-10-07 起生产用的就是它）：
+
+```sh
+# 服务器上，源码目录里（镜像由 Dockerfile 从 dist/bundle/main.js 打）
+docker compose -f deploy/docker/compose.yaml build
+docker compose -f deploy/docker/compose.yaml up -d
+curl -s http://127.0.0.1:8787/healthz             # version 必须是新版本，不是 0.0.0
+```
+
+**② 裸机 systemd**：
+
 ```sh
 pnpm build
 scp dist/bundle/main.js root@HOST:/opt/dsh-remote-control/server/relay.mjs
@@ -754,6 +767,18 @@ curl -s https://drc.example.com/healthz       # version 必须是新版本，不
 `relay.mjs` 旁边没有 `package.json`，也没有 `node_modules`：**升级就是替换一个文件**。
 未配 `DRC_STATE_FILE` 落盘时重启会丢掉全部配对关系（§6），所以挑一个没人正在用手机的时刻；
 主机与手机会各自重连回来。
+
+### 10.1 升级前先备份（2026-10-12 那次事故之后的纪律）
+
+`DRC_STATE_FILE` 里的 `hostTokens` 是**凭据**（`.env` 里那枚之外的每一枚），所以：
+
+```sh
+cp -a /var/lib/dsh-remote-control/state.json /opt/dsh-remote-control/state-$(date +%Y%m%d-%H%M%S).json
+chmod 600 /opt/dsh-remote-control/state-*.json
+```
+
+⚠️ 读路径认**形状**、不认版本号（`version` 只是我们写出的标记）。所以升级时旧文件照读；
+但备份仍然要做 —— 那是给"升级改坏了写路径"留的退路，两件事互不替代。
 
 > ⚠️ 2026-10-11 晚：这一节原来叫「升级与回滚」，里面有 §10.2「回滚必须**成对**」、
 > §10.3 回滚步骤、§10.4 回滚验收，以及一张"两代之间帧名/字段都动过"的兼容矩阵。
@@ -777,9 +802,12 @@ curl -s https://drc.example.com/healthz       # version 必须是新版本，不
 **已验证**：单文件产物在生产上跑着（`/healthz` 计数与 `version` 对得上）、nginx 那份配置、
 systemd 那份单元、优雅停机与重启后 `unknown_session` 的行为（测试层）。
 
-**没有实测、只是照代码写的**：Caddy 反代、launchd 常驻、Docker 部署、
-`journalctl -p warning` 的实际过滤效果（§5.3）、停机窗口的探针行为（§4）、
-逐端版本对齐后的真配对验收（§10）。
+**已验证（2026-10-12，生产实例上实做）**：Docker 部署（`docker compose build` + `up -d`，
+含一次"状态文件没读回来"的事故与恢复 —— 记在伞仓 `deploy/README.md`）、systemd 那份单元、
+nginx 那份配置、优雅停机与重启后 `unknown_session` 的行为（测试层）。
+
+**没有实测、只是照代码写的**：Caddy 反代、launchd 常驻、
+`journalctl -p warning` 的实际过滤效果（§5.3）、停机窗口的探针行为（§4）。
 
 ---
 

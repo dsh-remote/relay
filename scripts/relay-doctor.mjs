@@ -159,7 +159,26 @@ async function main() {
       report('warn', '配好了落盘但一次都没写成功过', '会话表没变化时不写是正常的；跑一次配对再复查')
     }
   }
-  if (health.stateRestored === true) report('ok', '上次启动从状态文件恢复了会话表')
+  /**
+   * ⚠️ `stateRestored` 是**从状态文件读回来的会话条数**（`server.ts` 的
+   * `persistence.restored`），不是布尔。
+   *
+   * 这里原来写的是 `=== true` ⇒ 线上永远是数字 3，那条"恢复了会话表"的报告
+   * **一次都没出现过**（2026-10-12 review 抓到的死分支）。而它恰好是运维最想知道的一件：
+   * "重启之后配对还在吗"——在 `/healthz` 上，”读回来几条“就是这件事的答案。
+   *
+   * >0 说清恢复了几条；`0` 且落盘开着 = 要么真的没有会话，要么表是空的 —— 后者要说出来，
+   * 否则"重启后手机要重新扫码"这件事在诊断里看不出任何痕迹。
+   */
+  if (Number(health.stateRestored) > 0) {
+    report('ok', `上次启动从状态文件恢复了 ${health.stateRestored} 条会话（重启后配对还在）`)
+  } else if (health.persistence === 'on' && Number(health.conversations) === 0) {
+    report(
+      'warn',
+      '落盘开着，但这次启动没恢复任何会话、当前也没有会话',
+      '若刚重启过：查状态文件是否可读、hostTokens 是否为空',
+    )
+  }
 
   // ④ 连接与限流（排错时最常问的三个数）
   report(

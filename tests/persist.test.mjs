@@ -785,3 +785,40 @@ test('写盘失败只记日志、绝不抛（起不来的中继等于整个产�
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/**
+ * ⚠️⚠️ **读路径不许拿 `version` 数字当判据** —— 2026-10-12 生产事故的专门判据。
+ *
+ * ## 为什么这条只能查源码
+ *
+ * 那一次的表现是：3.1.3 写出的盘上文件（形状与 v2 **逐字段相同**）在升级那一刻被整份丢掉
+ * —— 10 枚令牌、3 条配对会话清零，随后空状态还覆盖了盘上文件。而行凶的
+ * `if (file.version !== STATE_FILE_VERSION) return undefined` 在**删掉之前**，
+ * 所有行为判据都是绿的（它们测的是"读得进来"，而那份文件确实是 v2 形状的）。
+ *
+ * ⇒ 要防的不是某个 bug，是**这个写法回来**。所以这里查源码：
+ * 剥掉注释（源码里有大段解释这次事故的注释，里面逐字引用了那行代码），
+ * 再断言 `file.version` 不参与任何拒绝判定。
+ */
+test('读路径不许拿 version 数字当判据（生产事故的形状不许回来）', () => {
+  const src = readFileSync(new URL('../src/persist.ts', import.meta.url), 'utf8')
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  assert.doesNotMatch(
+    code,
+    /file\.version\s*!==?\s*STATE_FILE_VERSION/,
+    '不许拿 `file.version !== STATE_FILE_VERSION` 拒收：那会把形状完全相同的 3.1.3 文件整份丢掉',
+  )
+  assert.doesNotMatch(
+    code,
+    /if\s*\(\s*file\.version\b/,
+    '`file.version` 不该出现在任何拒绝分支里 —— 判断"读得懂读不懂"的是形状，不是数字',
+  )
+  // 反向自检：把当年那行塞回去，这条必须立刻红（否则它是恒绿的）
+  assert.match(
+    'if (file.version !== STATE_FILE_VERSION) { return undefined }',
+    /file\.version\s*!==?\s*STATE_FILE_VERSION/,
+    '反向样本必须被这条判据抓到',
+  )
+  // 而"版本号仍然被写出来"这件事要继续成立（读认形状 ≠ 写跟着降级）
+  assert.match(code, /version:\s*STATE_FILE_VERSION/, '写出的一侧仍然要标当前版本')
+})

@@ -8,7 +8,7 @@ DSH Remote Control 的**零知识 WebSocket 中继**：在宿主插件与已配�
 
 ## 自托管
 
-完整配方（环境变量表、systemd / docker / nginx、排错、升级与回滚）见
+完整配方（环境变量表、systemd / docker / nginx、排错、升级）见
 [`docs/SELF-HOSTING.md`](docs/SELF-HOSTING.md)。最速验证：
 
 ```sh

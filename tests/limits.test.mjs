@@ -4,7 +4,7 @@
  * 需求来源：docs/DESIGN-REVIEW.md 第 11 条（🟡）——「慢消费者 1008 会与手机的 12s 超时 /
  * 30s 退避形成循环」。读码确证后，这条不只是"阈值没实测"，而是**判定本身写错了**：
  *
- * 1. 断开的窗口对 client 与 host 用了同一个值（10s）。可 client 侧 `mp/core/socket.js`
+ * 1. 断开的窗口对 client 与 host 用了同一个值（10s）。可 client 侧 `packages/client/core/socket.js`
  *    每次 `onOpen` 都把退避重置为 0（:169 / :213），而 `onClose` **不读关闭码**（全文没有
  *    任何一处读 code），于是"被踢 → ~1s 后回来 → 再被踢"是一个**永不升级的 ~11s 循环**，
  *    用户只看到"连接已断开，正在重连…"。中继在这里是那台发动机。
@@ -27,15 +27,23 @@ import { PEER_CYCLE_MS, PEER_RECONNECT, PEER_SOURCE } from './fixtures/peer-reco
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 /**
- * 对端源码的位置。独立仓里默认找不到（返回镜像），合仓里默认就在 `../../mp/core/socket.js`；
+ * 对端源码的位置。独立仓里默认找不到（退回镜像夹具），**合仓里就在 `packages/client/core/socket.js`**；
  * 也可以用 `DRC_MP_SOCKET` 显式指过去。
+ *
+ * ⚠️⚠️ **这里原来写的是 `../../mp/core/socket.js`** —— 那是 v2 的目录布局（小程序当时住在 `mp/`）。
+ * 合进单仓、小程序搬到 `packages/client/` 之后这个路径就再也指不到东西了，于是：
+ *   · `peerParams()` 一直退回**镜像夹具**（它自称"优先以源码为准"）；
+ *   · 那条「镜像夹具与小程序源码一致」的判据在**合仓里也一直 SKIP**（跳过理由写着
+ *     "本仓里没有对端源码" —— 而本仓其实有）。
+ * 2026-10-12 review 抓到：判据看着在，实际从没跑过。修法与 A1 那次同一条：
+ * **让"跑没跑"本身可观测** —— 下面那条 skip 理由现在会打出它找过的路径。
  */
-const MP_SOCKET = process.env.DRC_MP_SOCKET ?? path.resolve(here, '..', '..', 'mp', 'core', 'socket.js')
+const MP_SOCKET = process.env.DRC_MP_SOCKET ?? path.resolve(here, '..', '..', 'client', 'core', 'socket.js')
 
 /** 从 mp 源码里读一个 `NAME = 123` 形式的常量（小程序端是唯一事实源，不许抄进注释就算）。 */
 function mpConstant(source, name) {
   const matched = new RegExp(`${name}\\s*=\\s*([0-9_]+)`).exec(source)
-  assert.ok(matched, `mp/core/socket.js 里找不到 ${name}：对端改了常量名，这条不变量得跟着改`)
+  assert.ok(matched, `对端源码里找不到 ${name}（找过 ${MP_SOCKET}）：对端改了常量名，这条不变量得跟着改`)
   return Number(matched[1].replace(/_/g, ''))
 }
 
@@ -71,7 +79,11 @@ test('客户端窗口必须大于对端自己的重连周期：否则中继就�
 
 test(
   '镜像夹具与小程序源码一致',
-  { skip: existsSync(MP_SOCKET) ? false : '本仓里没有对端源码（合仓或 DRC_MP_SOCKET 指向时才跑）' },
+  {
+    skip: existsSync(MP_SOCKET)
+      ? false
+      : `找不到对端源码（找过 ${MP_SOCKET}）—— 独立仓里这是正常的，用 DRC_MP_SOCKET 指过去即可`,
+  },
   () => {
     const peer = peerParams()
     assert.deepEqual(

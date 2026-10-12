@@ -18,7 +18,7 @@ import { killChildNow, stopChild } from './child-harness.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -200,4 +200,76 @@ test('落盘时间不许渲染成 1970 年（stateSavedAtSec 是"进程内第几
     `诊断输出里出现了 1970 年：stateSavedAtSec 是进程内相对秒数，按 epoch 解读就会这样\n${out.slice(0, 400)}`,
   )
   assert.doesNotMatch(out, /T00:00:/, '输出里出现了 ISO 时间戳（那正是把相对秒当 epoch 的形状）')
+})
+
+/**
+ * ⚠️ **`stateRestored` 是条数，不是布尔** —— 2026-10-12 review 抓到的死分支。
+ *
+ * 诊断脚本原来写的是 `if (health.stateRestored === true)`，而 `/healthz` 的
+ * `stateRestored` 是 `persistence.restored`（从状态文件读回来的**会话条数**）。
+ * 线上实测它是 `3` ⇒ 那条"恢复了会话表"的报告一次都没出现过，而它恰好是运维
+ * 最想知道的一件事："重启之后配对还在吗"。
+ *
+ * 所以这条判据**起两次真中继**（同一份状态文件）：第一次跑出状态，第二次读回来 ——
+ * 第二次的 `stateRestored` 是个正数，诊断必须把它说出来。
+ */
+test('从状态文件恢复过会话时，诊断必须说清"重启后配对还在"（stateRestored 是条数不是布尔）', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'drc-doctor-restore-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const stateFile = join(dir, 'state.json')
+
+  /**
+   * 直接写一份**形状合法**的 v2 状态文件（两条会话）。
+   *
+   * 为什么不起真中继先跑一次配对：这条判据的对象是**诊断脚本的报告**，
+   * 不是"恢复"本身（那件事在 `persist.test.mjs` 里由跨实例判据盯着）。
+   * 而形状必须合法 —— 读路径的形状闸会把坏条目丢掉，那样这条判据测的就是空表。
+   */
+  writeFileSync(
+    stateFile,
+    JSON.stringify({
+      version: 2,
+      savedAt: Date.now(),
+      conversations: [
+        {
+          conversationId: 'c_0123456789ab',
+          hostId: 'drc-0123456789ab',
+          clients: ['client-a'],
+          seqHost: 3,
+          lastActivityAt: Date.now(),
+        },
+        {
+          conversationId: 'c_abcdefabcdef',
+          hostId: 'drc-0123456789ab',
+          clients: [],
+          seqHost: 0,
+          lastActivityAt: Date.now(),
+        },
+      ],
+      hostTokens: [],
+    }),
+  )
+
+  // 起真中继读这份文件 ⇒ /healthz 的 stateRestored 是个正数（2）
+  const relay = await startRelay({ DRC_STATE_FILE: stateFile, DRC_STATE_SAVE_MS: '60000' })
+  t.after(() => relay.stop())
+  await sleep(150)
+
+  const { out } = runDoctor(`http://127.0.0.1:${relay.port}`)
+  assert.match(out, /恢复了 2 条会话/, `诊断没说清恢复了几条：\n${out.slice(0, 500)}`)
+  assert.match(out, /重启后配对还在/, '要说清这句话的含义 —— 运维看到的是"重启之后还会不会掉线"')
+})
+
+/** 反向：`stateRestored === true` 那个旧写法必须被判据抓得到（证明它查的是布尔而非条数）。 */
+test('反向自检：把"条数比较"换成"布尔比较"，上面那条立刻红', async (t) => {
+  const doctor = readFileSync(DOCTOR, 'utf8')
+  const code = doctor.replace(/\/\*[\s\S]*?\*\//g, '')
+  // 旧写法（造成死分支的那个）必须不在源码里
+  assert.doesNotMatch(
+    code,
+    /stateRestored\s*===\s*true/,
+    '不许回到 `stateRestored === true`：那是把条数当布尔，线上永远走不到',
+  )
+  // 而新写法必须在
+  assert.match(code, /Number\(health\.stateRestored\)\s*>\s*0/, '必须按条数判断（>0 才说"恢复了"）')
 })
