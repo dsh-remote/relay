@@ -822,3 +822,36 @@ test('读路径不许拿 version 数字当判据（生产事故的形状不许�
   // 而"版本号仍然被写出来"这件事要继续成立（读认形状 ≠ 写跟着降级）
   assert.match(code, /version:\s*STATE_FILE_VERSION/, '写出的一侧仍然要标当前版本')
 })
+
+/**
+ * ⚠️ **`hostId` 上限在两处各写一份，必须相等** —— 2026-10-12 review 抓到的隐患。
+ *
+ * `server.ts` 在**认领/握手**的门口卡 `rawHostId.length > MAX_HOST_ID_LEN`，
+ * `persist.ts` 在**读盘**时按同一个上限筛令牌表。两处漂移的后果很具体：
+ * 签发的上限比落盘读取的上限**宽** ⇒ 一枚合法签发的 hostId 写进状态文件后
+ * **读不回来**（`sanitizeHostTokens` 按设计逐条丢掉），而那台主机"盘上有令牌就不再认领"
+ * ⇒ **永久连不上**，日志里只有一行 `host tokens dropped`。
+ *
+ * 注释写了"必须一致"，但没有人钉它 —— 这条判据就是那个"人"。
+ * 只查源码：这两个常量都不出现在的运行时读数里，行为判据够不着。
+ */
+test('hostId 上限在两处必须相等（口径不同会让主机"签得下来、读不回来"）', () => {
+  const read = (rel) => readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf8')
+  const lit = (src, name) => {
+    const m = new RegExp(`${name}\\s*=\\s*(\\d+)`).exec(src)
+    assert.ok(m, `源码里找不到 ${name}：判据失效了（它会静默放过一切）`)
+    return Number(m[1])
+  }
+  const server = read('server.ts')
+  const persist = read('persist.ts')
+  const a = lit(server, 'MAX_HOST_ID_LEN')
+  const b = lit(persist, 'MAX_HOST_ID_LEN')
+  assert.equal(
+    a,
+    b,
+    `server.ts 是 ${a}、persist.ts 是 ${b}：两处必须逐字相同，` +
+      '否则会出现"认领成功、落盘、重启后那枚令牌被静默丢掉"的主机永久连不上',
+  )
+  // 反向自检：把它改一个数，上面那条必须红
+  assert.notEqual(Number('201'), a, '反向自检：不同的值不该被判等')
+})
