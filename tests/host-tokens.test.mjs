@@ -15,10 +15,14 @@
  * 于是有了现在这套：带 `{hostId}` 认领**只顶掉这台机器自己**旧的那一枚
  * （用户原话："后面的顶掉前面的"），env 那枚永不参与轮换，令牌随之落盘。
  *
+ * ⚠️ 2026-10-11 晚（用户裁决「不需要兼容老客户端」）**拿掉了"未绑定槽位"**：
+ * 不带 hostId 的认领从 200 改成 400 `host_id_required`，`hostTokenAccepted` 也不再认它。
+ * 那枚令牌原来对**任意** hostId 都算数 ⇒ 谁领一枚就能冒充任何主机（② 那条判据的由来）。
+ *
  * ## 这个文件钉的是"行为"，不是"实现"
  *
  * 全部用真 HTTP + 真 WebSocket 打真中继（`createRelay` + `loadConfig`），
- * 不 import 内部函数 —— 要验的恰恰是"它接在正确的位置、接对了三条来源"。
+ * 不 import 内部函数 —— 要验的恰恰是"它接在正确的位置、接对了两条来源"。
  * 每条判据都配一个**反证**（要么在同一测试里，要么就是另一条测试的阳性面）：
  * 只证明"能连上"是不够的，还得证明"该拒的真的拒了"，否则一条恒绿的断言
  * 可以在"闸根本不存在"的世界里通过。
@@ -31,6 +35,7 @@ import path from 'node:path'
 import WebSocket from 'ws'
 import { loadConfig } from '../dist/src/config.js'
 import { createRelay } from '../dist/src/server.js'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 const ENV_TOKEN = 'host-tokens-test-env-token-0123456789abcdef'
 const hex48 = /^[0-9a-f]{48}$/
@@ -54,7 +59,7 @@ async function startRelay(overrides = {}) {
   return { relay, port, base: `http://127.0.0.1:${port}`, wsUrl: `ws://127.0.0.1:${port}` }
 }
 
-/** 认领一枚。`hostId` 省略就是"老客户端"那条路（不带体/不带 hostId）。 */
+/** 认领一枚。**必须给 hostId** —— 不带 hostId 的认领从 2026-10-11 晚起一律 400。 */
 async function claim(base, hostId) {
   const init = { method: 'POST' }
   if (hostId !== undefined) {
@@ -89,7 +94,7 @@ function sayHello(wsUrl, hostId, token) {
     }
     const timer = setTimeout(() => finish({ t: 'timeout' }), 3_000)
     ws.on('open', () => {
-      ws.send(JSON.stringify({ t: 'hello', role: 'host', hostId, token, label: 'test' }))
+      ws.send(JSON.stringify({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, hostId, token, label: 'test' }))
     })
     ws.on('message', (raw) => {
       clearTimeout(timer)
@@ -141,35 +146,45 @@ test('①b 同一台机器再认领 ⇒ 只顶掉它自己旧的那一枚（"后
   }
 })
 
-// ── ② 老客户端（不带 hostId）语义不变，而且关在自己的槽位里 ──────────────
+// ── ② 不带 hostId 的认领**一律拒**（2026-10-11 晚：不做老客户端兼容）──────────
 
-test('② 不带 hostId 的认领：旧语义（作废上一枚）保留，且动不了按 hostId 的那枚', async () => {
+test('② 不带 hostId 的认领 ⇒ 400 `host_id_required`，一枚都不签', async () => {
   const { relay, base, wsUrl } = await startRelay()
   try {
-    const perHost = await claim(base, 'host-aaa')
-    const legacy1 = await claim(base)
-    // 老客户端（3.1.2）认领来的令牌，挂在**任意** hostId 上都算数 —— 这正是旧语义
-    assert.equal((await sayHello(wsUrl, 'host-zzz', legacy1.body.token)).t, 'hello-ok', '老客户端必须仍然能连上')
-    const legacy2 = await claim(base)
-    assert.equal((await sayHello(wsUrl, 'host-zzz', legacy1.body.token)).t, 'error', '未绑定槽位仍是"认领即作废上一枚"')
-    assert.equal((await sayHello(wsUrl, 'host-zzz', legacy2.body.token)).t, 'hello-ok', '新领的那枚要能用')
-    // 关键：老客户端的这一轮顶替**不许波及**按 hostId 签发的令牌
+    const before = await claim(base, 'host-aaa')
+    // 老客户端那条路（不带体）现在被**明确**拒绝：它原来落到"未绑定槽位"，
+    // 而那枚令牌对任意 hostId 都算数 ⇒ 谁领一枚就能冒充任何主机。
+    const legacy = await claim(base)
+    assert.equal(legacy.status, 400, `不带 hostId 必须 400，实得 ${legacy.status}`)
+    assert.equal(legacy.body.error, 'host_id_required')
+    assert.equal(legacy.body.token, undefined, '被拒的请求不许回一枚可用的令牌')
+    // 反证：按 hostId 的那枚**完全不受影响**（拒掉的那次没动任何槽位）
     assert.equal(
-      (await sayHello(wsUrl, 'host-aaa', perHost.body.token)).t,
+      (await sayHello(wsUrl, 'host-aaa', before.body.token)).t,
       'hello-ok',
-      '老客户端认领把按 hostId 的令牌顶掉了 ⇒ 隔离没做到',
+      '被拒的认领动了别人的令牌 ⇒ 拒绝路径本身在改状态',
     )
   } finally {
     await relay.close()
   }
 })
 
-test('②b 响应体里 hostId 为空串 = 未绑定槽位（调用方能分辨自己走的是哪条路）', async () => {
+test('②b 空字符串 / 非字符串 / 坏 JSON 的 hostId 也一律 400（没有"宽松兼容"这条退路）', async () => {
   const { relay, base } = await startRelay()
   try {
-    const res = await claim(base)
-    assert.equal(res.status, 200)
-    assert.equal(res.body.hostId, '', '不带 hostId 时回空串，而不是省略字段')
+    for (const body of ['{"hostId":""}', '{"hostId":42}', '{nope', '[1,2,3]']) {
+      const res = await fetch(`${base}/api/claim-token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+      })
+      assert.equal(res.status, 400, `体 ${body} 该被拒，实得 ${res.status}`)
+      const answer = await res.json()
+      assert.ok(
+        typeof answer.error === 'string' && answer.error.length > 0,
+        '要给出错误码（排错时"为什么没领到"全靠它）',
+      )
+    }
   } finally {
     await relay.close()
   }
@@ -180,7 +195,7 @@ test('②b 响应体里 hostId 为空串 = 未绑定槽位（调用方能分辨�
 test('③ env 里的 DRC_HOST_TOKEN 认领多少次都还在（它就是运维的兜底凭据）', async () => {
   const { relay, base, wsUrl } = await startRelay()
   try {
-    for (const hostId of ['host-aaa', 'host-bbb', undefined, 'host-aaa']) {
+    for (const hostId of ['host-aaa', 'host-bbb', 'host-aaa', 'host-ccc']) {
       const res = await claim(base, hostId)
       assert.equal(res.status, 200, `认领失败：${res.status}`)
       assert.notEqual(res.body.token, ENV_TOKEN, '签出来的必须是一枚新的，不能把 env 那枚发出去')

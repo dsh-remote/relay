@@ -57,20 +57,17 @@ docker compose … logs relay | jq 'select(.msg=="counters")'
 json-file 轮转（`max-size: 10m` / `max-file: 5`）。要长期留存就装一个日志驱动转发出去，
 别依赖 `docker logs`。
 
-## 升级与回滚
+## 升级
 
 ```sh
 # 升级：构建 → 重启 → 看版本号变了没有
 docker compose -f deploy/docker/compose.yaml up -d --build
 curl -s http://127.0.0.1:8787/healthz | grep -o '"version":"[^"]*"'
-
-# 回滚：把标签切回去再 up（镜像还在本地）
-docker tag dsh-remote-relay:2.0.14 dsh-remote-relay:2.0.15
-docker compose -f deploy/docker/compose.yaml up -d
 ```
 
-**回滚必须成对**（中继产物 + 主机插件产物）：两代握手帧名不兼容，只回滚一边会
-"永远配不上对"或"静默不上线"。见 `../SELF-HOSTING.md` §10.2 的对照表。
+三端（中继 / 宿主插件 / 小程序）必须升到**同一协议版本**：落后的一端会在 `hello` 那一刻
+被明确拒掉（`unsupported_protocol`）。⚠️ 2026-10-11 晚：原来这里还写着一套"成对回滚 +
+两代兼容矩阵"，随能力位与版本协商机制一起删掉了 —— 没有老用户，不需要回滚路径。
 
 ## 拉不到 Docker Hub 怎么办
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.1.4
+
+> 四个包一起 bump 到 `3.1.4`。**主题：把"向后兼容"整条清掉**（用户裁决：没有真实用户）。
+
+- **协议版本闸变严**：`hello.protocol` 必填且必须等于本端版本。中继在 `handleFrame` 的
+  `hello` 分支一次判定，不满足即 `error{unsupported_protocol}` + close 1002。
+- **观测面收敛**：`/healthz` 删掉 `protocolMin` / `peerProtocolMin` / `peerProtocolMax` /
+  `peersNoProtocol` 四个字段，以及支撑它们的整套按连接计数（`Peer.protocol` /
+  `countedProtocol` 闩锁）。单版本制下"对端版本分布"不存在 —— 只留 `protocolSelf`。
+- **落盘格式升 v2**：`state.json` 的 `hostTokens` 从"可选、老文件当空表"变成**必需字段**；
+  v1 文件不再有读路径（读到没有该数组的文件当空表并留一行 warn）。
+- `relay-doctor` 的白名单与报告文案跟着收敛（原来会读那四个已删字段）。
+- 判据：`handshake.test.mjs` 的"老端点照常连上"翻成"**没报版本一律拒**"；删掉三条
+  `peerProtocols` 观测面判据；`relay.test.mjs` 里写死 `version: 1` 的那条改成读
+  `STATE_FILE_VERSION`（升格式不该红在无关的地方）。
+
 ## 3.1.3
 
 > 四个包一起 bump 到 `3.1.3`。**这一版修的是 3.1.2 那个认领接口的模型缺陷** ——
@@ -118,6 +134,7 @@ hostId 形状不合法 400 / `/healthz` 不泄露令牌。另修了两条**假�
 - **Windows 服务配方**（`deploy/windows/drc-relay-install.cmd`，NSSM）：v2 只有 systemd 与容器两条路。
   它把 `AppStopMethodConsole` 设成先发 Ctrl+C——那 15 秒里优雅停机才跑得起来。
 - **一条诊断命令** `scripts/relay-doctor.mjs`：读 `/healthz` 二十三个字段给结论 + 下一步，
+  （⚠️ 3.1.3 给 `/healthz` 补了 `hostTokens` ⇒ 现在是**二十四个**，见 `README.md` 那张表），
   非 0 退出码可被监控判。**只读白名单**：响应里混进来的凭据字段不出现
   （判据用一个故意混进凭据的假响应验证）。
 - 脚本去 shell 化：`relay-start.sh` → `.mjs`（`grep -oE` 那段变成可单测的纯函数 `readHostToken`）。

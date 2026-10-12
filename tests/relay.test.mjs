@@ -12,6 +12,8 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { createRelay } from '../dist/src/server.js'
 import { loadConfig } from '../dist/src/config.js'
+import { STATE_FILE_VERSION } from '../dist/src/persist.js'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 /** 一眼假的 token；测试里绝不用真实凭据。 */
 const TOKEN = 'unit-test-host-token-0123456789abcdef'
@@ -153,7 +155,7 @@ async function waitFor(predicate, timeoutMs = 2000) {
 
 async function pairUp(ctx, { hostLabel = 'bins', clientId = 'inst-1', token = '123456' } = {}) {
   const host = await Peer.connect(ctx.url)
-  host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, label: hostLabel })
+  host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, label: hostLabel })
   const hostOk = await host.until((f) => f.t === 'hello-ok')
   assert.equal(hostOk.role, 'host')
   host.send({ t: 'pair-begin', pairingToken: token })
@@ -164,6 +166,7 @@ async function pairUp(ctx, { hostLabel = 'bins', clientId = 'inst-1', token = '1
   client.send({
     t: 'hello',
     role: 'client',
+    protocol: PROTOCOL_VERSION,
     protocol: 1,
     clientId,
     clientMeta: { platform: 'wechat-mp', label: '微信小程序' },
@@ -185,6 +188,7 @@ test('注册：客户端 hello 得到 hello-ok，且 relay 原样保留它带来
     client.send({
       t: 'hello',
       role: 'client',
+      protocol: PROTOCOL_VERSION,
       protocol: 1,
       clientId: 'mdwx-abc',
       clientMeta: { platform: 'wechat-mp' },
@@ -201,7 +205,7 @@ test('注册：不带 clientId 时中继代发一个（客户端会采纳并沿�
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', protocol: 1 })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1 })
     const ok = await client.until((f) => f.t === 'hello-ok')
     assert.ok(ok.clientId && ok.clientId.length > 0)
     assert.equal(ctx.relay.state.clients.has(ok.clientId), true)
@@ -215,9 +219,9 @@ test('鉴权：错 token 被拒并在用尽次数后断开 4001', async () => {
   try {
     const host = await Peer.connect(ctx.url)
     ctx.open.push(host)
-    host.send({ t: 'hello', role: 'host', token: 'wrong-token-value-here-000000' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: 'wrong-token-value-here-000000' })
     for (let i = 0; i < 3; i++) {
-      host.send({ t: 'hello', role: 'host', token: 'wrong-token-value-here-00000' + i })
+      host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: 'wrong-token-value-here-00000' + i })
       const err = await host.until((f) => f.t === 'error' && f.code === 'bad_token')
       assert.ok(err)
     }
@@ -254,7 +258,7 @@ test('配对前置：pair-begin 只能由主机发，认领只能由客户端发
 
     const anon = await Peer.connect(ctx.url)
     ctx.open.push(anon)
-    anon.send({ t: 'hello', role: 'client', clientId: 'i2' })
+    anon.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'i2' })
     await anon.until((f) => f.t === 'hello-ok')
     anon.send({ t: 'pair-begin', pairingToken: '123456' })
     assert.ok(await anon.until((f) => f.t === 'error' && f.code === 'need_host'))
@@ -268,7 +272,7 @@ test('配对码：未知码 invalid_or_expired，重放 already_used（两个 re
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'i3' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'i3' })
     await client.until((f) => f.t === 'hello-ok')
     client.send({ t: 'pair-begin-client', pairingToken: '999999' })
     assert.equal((await client.until((f) => f.t === 'pair-fail')).reason, 'invalid_or_expired')
@@ -329,7 +333,7 @@ test('D3：客户端断开重连后，同一会话继续可路由，主机不会
 
     const again = await Peer.connect(ctx.url)
     ctx.open.push(again)
-    again.send({ t: 'hello', role: 'client', clientId: 'inst-1' })
+    again.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'inst-1' })
     await again.until((f) => f.t === 'hello-ok')
     // 续用的判据是客户端一侧：它用原 convId 发指令，必须能直达主机。
     again.send({ t: 'enc', sessionId: conversationId, seq: 1, clientId: 'inst-1', ciphertext: CIPHER })
@@ -365,7 +369,7 @@ test('宽限期判死主机：每个成员恰好收到一条 peer-left（曾经�
     // 形状"。直接往状态表里放进这个成员——本用例要验的是**通知条数**这条不变量，
     // 而不是认领流程（那条路在 D4 与配对用例里）。
     const second = await Peer.connect(ctx.url)
-    second.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'inst-2' })
+    second.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'inst-2' })
     await second.until((f) => f.t === 'hello-ok')
     ctx.open.push(second)
     ctx.relay.state.conversations.get(conversationId).clients.add('inst-2')
@@ -391,7 +395,7 @@ test('D4：注册过但不属于该会话的客户端拿到 unknown_session（�
     const { conversationId } = await pairUp(ctx)
     const stranger = await Peer.connect(ctx.url)
     ctx.open.push(stranger)
-    stranger.send({ t: 'hello', role: 'client', clientId: 'intruder' })
+    stranger.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'intruder' })
     await stranger.until((f) => f.t === 'hello-ok')
     stranger.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
     const err = await stranger.until((f) => f.t === 'error')
@@ -424,7 +428,7 @@ test('复核 R3：同一 clientId 的后来者顶掉前者，前者收到 4000 �
     const { conversationId, host } = await pairUp(ctx)
     const newer = await Peer.connect(ctx.url)
     ctx.open.push(newer)
-    newer.send({ t: 'hello', role: 'client', clientId: 'inst-1' })
+    newer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'inst-1' })
     await newer.until((f) => f.t === 'hello-ok')
     const verdict = await ctx.open[1].closed
     assert.equal(verdict.code, 4000, '前者必须被明确关掉，否则它的 socket 还"开着"、永不重连')
@@ -443,7 +447,7 @@ test('复核 R1：主机重启后 resync 未列出的会话被回收，成员当
     // 模拟"主机进程重启"：新 socket、同一个 hostId、手里没有任何会话密钥。
     const reborn = await Peer.connect(ctx.url)
     ctx.open.push(reborn)
-    reborn.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId })
+    reborn.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, hostId })
     await reborn.until((f) => f.t === 'hello-ok')
     reborn.send({ t: 'resync', sessionIds: [] })
     await sleep(80)
@@ -479,7 +483,7 @@ test('resync 保住会话时，成员**不许**收到 peer-left（通知不能�
     const { host, client, conversationId, hostId } = await pairUp(ctx)
     const reborn = await Peer.connect(ctx.url)
     ctx.open.push(reborn)
-    reborn.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId })
+    reborn.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, hostId })
     await reborn.until((f) => f.t === 'hello-ok')
     reborn.send({ t: 'resync', sessionIds: [conversationId] })
     await sleep(80)
@@ -496,7 +500,7 @@ test('未知会话：enc 得到 unknown_session（手机端据此提示重新配
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'lonely' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'lonely' })
     await client.until((f) => f.t === 'hello-ok')
     client.send({ t: 'enc', sessionId: 'c_deadbeefdead', ciphertext: CIPHER })
     assert.equal((await client.until((f) => f.t === 'error')).code, 'unknown_session')
@@ -543,7 +547,7 @@ test('畸形输入一律被拒而不崩：非法 JSON、二进制帧、坏 base6
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'junk' })
     await client.until((f) => f.t === 'hello-ok')
 
     client.rawText('{not json')
@@ -607,7 +611,7 @@ test('ping/pong 原样回带 ts；两个客户端互不干扰', async () => {
     const { host, client, conversationId } = await pairUp(ctx, { clientId: 'a' })
     const other = await Peer.connect(ctx.url)
     ctx.open.push(other)
-    other.send({ t: 'hello', role: 'client', clientId: 'b' })
+    other.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'b' })
     await other.until((f) => f.t === 'hello-ok')
     other.send({ t: 'pair-begin-client', pairingToken: 'nope-nope' })
     assert.equal((await other.until((f) => f.t === 'pair-fail')).reason, 'invalid_or_expired')
@@ -696,7 +700,7 @@ test('F4：每一条 hello 都必有一个 hello-ok（错 role 也要有回应�
   const ctx = await startRelay()
   try {
     for (const hello of [
-      { t: 'hello', role: 'client', clientId: 'a1' },
+      { t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'a1' },
       { t: 'hello', role: 'weird' },
       { t: 'hello' },
     ]) {
@@ -762,7 +766,7 @@ test('T6：根路径与任意自定义路径都能 upgrade（老地址不能连�
     for (const path of ['/', '/ws', '/drc', '/a/b/c']) {
       const peer = await Peer.connect(ctx.url + path)
       ctx.open.push(peer)
-      peer.send({ t: 'hello', role: 'client', clientId: `p-${path}` })
+      peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: `p-${path}` })
       assert.equal((await peer.until((f) => f.t === 'hello-ok')).role, 'client', path)
     }
   } finally {
@@ -776,7 +780,7 @@ test('R2：发给手机的 error 一律带中文 message（英文 code 不可能
     const { conversationId } = await pairUp(ctx)
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'reader' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'reader' })
     await client.until((f) => f.t === 'hello-ok')
     client.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
     const err = await client.until((f) => f.t === 'error')
@@ -827,13 +831,13 @@ test('R3：被顶号的旧 socket 会重连并重新拿到身份（不靠人工�
     const first = ctx.open[1]
     const newer = await Peer.connect(ctx.url)
     ctx.open.push(newer)
-    newer.send({ t: 'hello', role: 'client', clientId: 'inst-1' })
+    newer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'inst-1' })
     await newer.until((f) => f.t === 'hello-ok')
     assert.equal((await first.closed).code, 4000)
     // 小程序的 socket 层在收到 close 后会自动重连；这里模拟它重连回来的那条连接
     const reconnected = await Peer.connect(ctx.url)
     ctx.open.push(reconnected)
-    reconnected.send({ t: 'hello', role: 'client', clientId: 'inst-1' })
+    reconnected.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'inst-1' })
     await reconnected.until((f) => f.t === 'hello-ok')
     host.send({ t: 'enc', sessionId: conversationId, ciphertext: CIPHER })
     assert.equal((await reconnected.until((f) => f.t === 'enc')).sessionId, conversationId)
@@ -911,13 +915,13 @@ test('P1-2：同一 socket 二次 hello 换 clientId，旧键必须释放（未�
   try {
     const peer = await Peer.connect(ctx.url)
     ctx.open.push(peer)
-    peer.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'first-id' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'first-id' })
     await peer.until((f) => f.t === 'hello-ok')
     assert.equal(ctx.relay.state.clients.has('first-id'), true)
 
     // 同一条连接换身份：旧实现只 set 新键，close 时又只按最后一次的 clientId 调
     // clientGone —— 旧键永远留在表里。实测单连接 3000 个 id → clients:499。
-    peer.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'second-id' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'second-id' })
     const ok = await peer.until((f) => f.t === 'hello-ok' && f.clientId === 'second-id')
     assert.equal(ok.clientId, 'second-id')
     assert.equal(
@@ -943,9 +947,9 @@ test('P1-2：主机同 socket 换 hostId 也要释放旧键（同形缺陷，只
   try {
     const host = await Peer.connect(ctx.url)
     ctx.open.push(host)
-    host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId: 'host-one' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, hostId: 'host-one' })
     await host.until((f) => f.t === 'hello-ok')
-    host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId: 'host-two' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, hostId: 'host-two' })
     await host.until((f) => f.t === 'hello-ok' && f.hostId === 'host-two')
     assert.equal(ctx.relay.state.hosts.has('host-one'), false, '旧 hostId 键必须被释放')
     assert.equal(ctx.relay.state.hosts.size, 1)
@@ -963,7 +967,7 @@ test('主机重连不再向客户端重放 peer-joined（随仓 mp 客户端没�
     // 字段还把 hostId 塞进了 clientId。既然没人消费，就不该有这条假信号。
     const reborn = await Peer.connect(ctx.url)
     ctx.open.push(reborn)
-    reborn.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, hostId })
+    reborn.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, hostId })
     await reborn.until((f) => f.t === 'hello-ok')
     await client.expectNone((f) => f.t === 'peer-joined', 300)
 
@@ -1034,7 +1038,10 @@ test('停机兜底：forceShutdown 补写一次盘并把 shutdownForced 记进 /
     ctx.relay.forceShutdown()
     const health = ctx.relay.health()
     assert.equal(health.shutdownForced, 1, '兜底停机必须留下计数：它与排空成功同码 exit(0)，退出码分不出来')
-    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).version, 1, '兜底路径也要补写一次盘')
+    // ⚠️ 判据写的是"补写一次盘"，不是"版本号恰好是某个字面量"：
+    // 落盘格式版本会随格式改动往上走（2026-10-11 晚 v1 → v2），
+    // 这里钉死数字的话，升版本时红的是一个与"兜底写盘"无关的地方。
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).version, STATE_FILE_VERSION, '兜底路径也要补写一次盘')
   } finally {
     await ctx.close()
     rmSync(dir, { recursive: true, force: true })
@@ -1102,6 +1109,7 @@ test('/healthz 诊断计数：丢弃帧 / 慢消费者 / 被拒配对 都有出�
     bogus.send({
       t: 'hello',
       role: 'client',
+      protocol: PROTOCOL_VERSION,
       protocol: 1,
       clientId: 'inst-bogus',
       clientMeta: { platform: 'wechat-mp' },
@@ -1162,7 +1170,7 @@ test('委托给 classify 之后，七步分流的错误码逐条不变', async (
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'junk' })
     await client.until((f) => f.t === 'hello-ok')
 
     // ⚠️ 这里**不能**用 `until((f) => f.t === 'error')` 逐条断言：那个助手是
@@ -1225,7 +1233,7 @@ test('enc-batch 的密文字符集也要逐项查（只查第一项是最容易�
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'junk' })
     await client.until((f) => f.t === 'hello-ok')
 
     // 第一项合法、第二项非法：只查第一项的实现会**放行**，而对端解不开 → 静默黑洞
@@ -1305,113 +1313,6 @@ test('防御纵深：绕过 loadConfig 直接构造 config 时，ping 桶数仍�
   }
 })
 
-test('观测面计数以**连接**为单位：一条连接连发 N 个 hello，计数只 +1', async () => {
-  // ## 缺陷形状
-  //
-  // `peerProtocols` 是 `/healthz` 的观测面，而它的注释承诺
-  // 「`peerProtocols.size === 0` 就是"当前没有对端"的判据，语义干净」。
-  //
-  // 原来每收一个 `hello` 就 +1，而 `close` 只 −1 —— 于是 re-hello（换身份，
-  // `releaseIdentityFor` 明确允许的设计内行为）N 次只抵消 1 次。
-  // 实测：一条连接 5 次 `hello(protocol=1)` 再关闭，`peerProtocolMin` 恒为 1、
-  // 永不回到 -1。而未认证对端单连接发 500 个 `hello`（帧闸 500/s 全放行）
-  // 就能把计数推高 500 —— 与「客户端身份键无界泄漏」那起事故同一形状，
-  // 而**这条注释恰好就在声明不会重犯**。
-  const ctx = await startRelay()
-  try {
-    const client = await Peer.connect(ctx.url)
-    ctx.open.push(client)
-    for (let i = 0; i < 5; i++) {
-      client.send({ t: 'hello', role: 'client', protocol: 1, clientId: `inst-${i}` })
-      await client.until((f) => f.t === 'hello-ok')
-    }
-    // ⚠️ 必须先断言**连着的时候**计数就是 1：只断言"断开后归零"的话，
-    // 一段"每次 +1 然后每次 -1"的实现也能过（那是把闩锁换成配对增减）——
-    // 而它对"未认证对端单连接刷 500 个 hello 把计数推高"这件事完全无效。
-    // 症状上那两者只在"断开后"看起来一样，而攻击面完全不同。
-    const during = ctx.relay.health()
-    assert.equal(during.peerProtocolMax, 1, `一条连接 5 次 hello，计数必须是 1 而实得 ${during.peerProtocolMax}`)
-    assert.equal(during.protocolMin, 1, `实得 ${JSON.stringify(during)}`)
-
-    // 关掉之后必须回到"没有对端"——这才是那句注释承诺的东西。
-    client.ws.close()
-    await sleep(150)
-    const after = ctx.relay.health()
-    assert.equal(after.peerProtocolMin, -1, '一条连接 5 次 hello 之后只该减 1 次，归零')
-    assert.equal(after.peerProtocolMax, -1, `实得 ${JSON.stringify(after)}：计数表没有归零`)
-    assert.equal(after.peersNoProtocol, 0)
-  } finally {
-    await ctx.close()
-  }
-})
-
-test('反向判据：没报版本的连接也只记一次（peersNoProtocol 与上面同口径）', async () => {
-  // 上面那条只覆盖"报了版本的连接"。而**没报版本**的连接 `peer.protocol` 恒为
-  // undefined，它同样要往 peersWithoutProtocol 里记一次——所以不能用
-  // `peer.protocol === undefined` 当"没记过"的判据。
-  const ctx = await startRelay()
-  try {
-    const client = await Peer.connect(ctx.url)
-    ctx.open.push(client)
-    for (let i = 0; i < 4; i++) {
-      client.send({ t: 'hello', role: 'client', clientId: `nover-${i}` })
-      await client.until((f) => f.t === 'hello-ok')
-    }
-    assert.equal(ctx.relay.health().peersNoProtocol, 1, '一条没报版本的连接只该计 1')
-    client.ws.close()
-    await sleep(150)
-    assert.equal(ctx.relay.health().peersNoProtocol, 0, '断开后必须归零')
-  } finally {
-    await ctx.close()
-  }
-})
-
-test('同一条连接从不报版本改成报版本：peersNoProtocol 必须减掉（否则观测面虚高）', async () => {
-  // 这一条钉的是**版本切换**那条支的减法：一条连接先不报协议、再报 1，
-  // 它在计数表里的位置必须从 `peersNoProtocol` 挪到 `peerProtocols`，
-  // 而不是两处各 +1。
-  //
-  // 少了那半句减法，症状是"peersNoProtocol 明明断了连接还 > 0"，
-  // 而它恰好是回答"是不是有老版本客户端还在用"的那个数 —— 一个**假的高**，
-  // 排错时会让人去追一个不存在的兼容性问题。
-  //
-  // ⚠️ 方向只能是"不报 → 报"：`PROTOCOL_VERSION` 就是 1，而版本闸会拒掉
-  // 大于它的值（实测 protocol:2 直接被 `acceptProtocol` 挡掉，连 hello-ok
-  // 都没有），所以"报 1 → 报 2"这条路径**不可达**，拿它写判据就是一条
-  // 恒红或恒绿的假判据。（第一次写的就是这个，变异验证时它恒绿——
-  // 因为连 `else if` 都没进去。）
-  const ctx = await startRelay()
-  try {
-    const client = await Peer.connect(ctx.url)
-    ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'sw1' }) // 不带 protocol
-    await client.until((f) => f.t === 'hello-ok')
-    assert.equal(ctx.relay.health().peersNoProtocol, 1, '先确认它进了"没报版本"那一格')
-    assert.equal(ctx.relay.health().peerProtocolMax, -1, '此刻没有任何对端报过版本')
-
-    // ⚠️ 这里**不能**用 `until((f) => f.t === 'hello-ok')`：那个助手是
-    // `frames.find(match)`，第一条 hello-ok 还在缓冲区里，于是它**立刻**返回
-    // ——而第二个 hello 此时可能还没被服务端处理。症状是"health 读到旧值"，
-    // 与实现无关。正确形状是数 hello-ok 的条数。
-    const before2 = client.frames.filter((f) => f.t === 'hello-ok').length
-    client.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'sw2' })
-    await waitFor(() => client.frames.filter((f) => f.t === 'hello-ok').length > before2)
-
-    const during = ctx.relay.health()
-    assert.equal(during.peersNoProtocol, 0, `它已经不报版本了，这一格必须减掉，实得 ${during.peersNoProtocol}`)
-    assert.equal(during.peerProtocolMax, 1, '同时进了"报了版本"那一格')
-    assert.equal(during.peerProtocolMin, 1)
-
-    client.ws.close()
-    await sleep(150)
-    const after = ctx.relay.health()
-    assert.equal(after.peerProtocolMin, -1, '断开后必须完全归零')
-    assert.equal(after.peersNoProtocol, 0, `实得 ${JSON.stringify(after)}`)
-  } finally {
-    await ctx.close()
-  }
-})
-
 test('re-hello 换身份：旧 clientId 必须从会话成员表里摘掉（否则空会话回收完全失效）', async () => {
   // 上面那条 state 级的判据钉的是 `leaveAll` 本身。这一条钉的是**接线**：
   // `releaseIdentityFor` 原来只走 `clientGone`（它**刻意不动成员表**，那是 D3 的
@@ -1433,7 +1334,7 @@ test('re-hello 换身份：旧 clientId 必须从会话成员表里摘掉（否�
     // 连发 3 次换 id 的 hello（模拟小程序重新安装/换设备后用新 installId 回来）
     for (let i = 0; i < 3; i++) {
       const n = client.frames.filter((f) => f.t === 'hello-ok').length
-      client.send({ t: 'hello', role: 'client', protocol: 1, clientId: `swapped-${i}` })
+      client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: `swapped-${i}` })
       await waitFor(() => client.frames.filter((f) => f.t === 'hello-ok').length > n)
     }
 
@@ -1539,7 +1440,7 @@ test('形状不合的 pair-begin-client：pair-fail **不带** token（不可信
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)
-    client.send({ t: 'hello', role: 'client', clientId: 'junk' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'junk' })
     await client.until((f) => f.t === 'hello-ok')
     client.send({ t: 'pair-begin-client' }) // 缺 pairingToken
     const fail = await client.until((f) => f.t === 'pair-fail' || f.t === 'error')

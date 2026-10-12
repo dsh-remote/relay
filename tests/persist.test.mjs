@@ -27,6 +27,7 @@ import { Log } from '../dist/src/log.js'
 import { RelayState, WS_OPEN } from '../dist/src/state.js'
 import { STATE_FILE_VERSION, readStateFile, restoreState, snapshotState, writeStateFile } from '../dist/src/persist.js'
 import { skipUnlessPosix } from './test-platform.mjs'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 const TOKEN = 'unit-test-host-token-0123456789abcdef'
 const CIPHER = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
@@ -146,7 +147,7 @@ class Peer {
 
 async function pairUp(ctx, { clientId = 'inst-1', token = '123456' } = {}) {
   const host = await Peer.connect(ctx.url)
-  host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, label: 'bins' })
+  host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, protocol: 1, token: TOKEN, label: 'bins' })
   const hostOk = await host.until((f) => f.t === 'hello-ok')
   host.send({ t: 'pair-begin', pairingToken: token })
   await host.until((f) => f.t === 'pair-ready')
@@ -155,6 +156,7 @@ async function pairUp(ctx, { clientId = 'inst-1', token = '123456' } = {}) {
   client.send({
     t: 'hello',
     role: 'client',
+    protocol: PROTOCOL_VERSION,
     protocol: 1,
     clientId,
     clientMeta: { platform: 'wechat-mp' },
@@ -212,7 +214,14 @@ test('验收 2：重启后手机用旧 convId 发帧，不回 unknown_session（
       // 同一台手机冷启动：还是存储里那个 clientId、那个 convId。
       const phone = await Peer.connect(second.url)
       second.open.push(phone)
-      phone.send({ t: 'hello', role: 'client', protocol: 1, clientId, clientMeta: { platform: 'wechat-mp' } })
+      phone.send({
+        t: 'hello',
+        role: 'client',
+        protocol: PROTOCOL_VERSION,
+        protocol: 1,
+        clientId,
+        clientMeta: { platform: 'wechat-mp' },
+      })
       await phone.until((f) => f.t === 'hello-ok')
       phone.send({ t: 'enc', sessionId: conversationId, seq: 1, ciphertext: CIPHER })
       const reply = await phone.until(
@@ -250,14 +259,22 @@ test('验收 2b：重启后主机 resync 声明该会话，手机与主机之间
       // 那台"新主机"自然不属于这条会话——路由是对的，身份认错了（真实插件总会带它）。
       const host = await Peer.connect(second.url)
       second.open.push(host)
-      host.send({ t: 'hello', role: 'host', protocol: 1, token: TOKEN, label: 'bins', hostId })
+      host.send({
+        t: 'hello',
+        role: 'host',
+        protocol: PROTOCOL_VERSION,
+        protocol: 1,
+        token: TOKEN,
+        label: 'bins',
+        hostId,
+      })
       const hostOk = await host.until((f) => f.t === 'hello-ok')
       assert.equal(hostOk.hostId, hostId, '主机身份必须原样认回')
       host.send({ t: 'resync', sessionIds: [conversationId] })
 
       const phone = await Peer.connect(second.url)
       second.open.push(phone)
-      phone.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'inst-1' })
+      phone.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'inst-1' })
       await phone.until((f) => f.t === 'hello-ok')
       // 上行：手机发一帧，**主机**收得到。成功的上行对发送方是静默的（不回任何帧），
       // 所以判据要落在收件人身上——落在手机身上等回复，等的是一条永远不存在的消息。
@@ -328,7 +345,7 @@ test('验收 4：状态文件损坏时中继照常起来，日志说清，并按
       // 数据面照常：中继起来了就必须还能用（"起不来"与"起来了但半残"同样是停摆）。
       const phone = await Peer.connect(ctx.url)
       ctx.open.push(phone)
-      phone.send({ t: 'hello', role: 'client', protocol: 1, clientId: 'inst-1' })
+      phone.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'inst-1' })
       const ok = await phone.until((f) => f.t === 'hello-ok')
       assert.equal(ok.clientId, 'inst-1')
     } finally {
@@ -501,7 +518,10 @@ test('逐条筛：坏掉 1 行不该让整份状态作废（代价是全部手�
       { ...good, lastActivityAt: 'soon' }, // 时间戳不是数
       null,
     ]
-    writeFileSync(p, JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 1, conversations: [good, ...cases] }))
+    writeFileSync(
+      p,
+      JSON.stringify({ version: STATE_FILE_VERSION, savedAt: 1, conversations: [good, ...cases], hostTokens: [] }),
+    )
     const cap = captureLog()
     const restored = restoreState(p, new RelayState(), cap.log, 1000)
     assert.equal(restored, 1, '好的那条必须留下')
@@ -532,9 +552,19 @@ test('安全模型不变：盘上没有任何秘密（D1：中继从来不持有
     const parsed = JSON.parse(raw)
     const fields = Object.keys(parsed.conversations[0]).sort()
     assert.deepEqual(fields, ['clients', 'conversationId', 'hostId', 'lastActivityAt', 'seqHost'])
-    for (const key of ['psk', 'token', 'secret', 'password']) {
+    for (const key of ['psk', 'secret', 'password']) {
       assert.ok(!raw.toLowerCase().includes(key), `不该出现 ${key}`)
     }
+    /**
+     * ⚠️ `hostTokens` **是**一个会落盘的字段（v2 起恒在，见 `persist.ts` 的
+     * `STATE_FILE_VERSION`）：它装的是中继**自己签发**的 host token，而那是设计上
+     * 就要持久化的东西（否则中继一重启，所有主机都得重新认领）。
+     * ⇒ 这一条判的不是"文件里没有 `token` 这个词"（那在字段名上就误报了 ——
+     * 2026-10-11 晚升 v2 时当场红过），而是"**协议的秘密值**一个都不在盘上"：
+     * PSK 是 16 字节的 base64、host token 是 48 位十六进制，两种形状都不许出现。
+     */
+    assert.deepEqual(parsed.hostTokens, [], '这一份里没有任何签发过的令牌')
+    assert.ok(!/[0-9a-f]{48}/.test(raw), '盘上不该出现 48 位十六进制的凭据值（host token）')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -558,6 +588,7 @@ test('hostOfflineSince 刻意不落盘，也不从（被手塞的）盘上恢复
       JSON.stringify({
         version: STATE_FILE_VERSION,
         savedAt: 1,
+        hostTokens: [],
         conversations: [
           {
             conversationId: 'c_bbbbbbbbbbbb',
@@ -612,6 +643,7 @@ test('emptySince 的两种恢复：有成员就不计时，空的从此刻（或
       JSON.stringify({
         version: STATE_FILE_VERSION,
         savedAt: 1,
+        hostTokens: [],
         conversations: [
           { conversationId: 'c_111111111111', hostId: 'h1', clients: ['inst-1'], seqHost: 0, lastActivityAt: 1 },
           { conversationId: 'c_222222222222', hostId: 'h1', clients: [], seqHost: 0, lastActivityAt: 1 },

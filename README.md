@@ -1,7 +1,7 @@
 # @dsh-remote/relay
 
 DSH Remote Control 的**零知识 WebSocket 中继**：在宿主插件与已配对的手机之间转发**密封记录**，
-只认帧名 / 会话 id / 能力协商，**从不解析载荷**——密文对它就是一个 base64 字符串。
+只认帧名 / 会话 id / 协议版本闸，**从不解析载荷**——密文对它就是一个 base64 字符串。
 
 生产形态是**单文件产物** `dist/bundle/main.js`（`ws` / `zod` / 协议层全部内联，运行时零依赖）；
 部署只有两种：拷这个单文件 + 起进程（systemd / docker / nginx 配方见下），或从源码构建。

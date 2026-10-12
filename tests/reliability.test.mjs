@@ -29,6 +29,7 @@ import { loadConfig } from '../dist/src/config.js'
 import { Log } from '../dist/src/log.js'
 import { RelayState } from '../dist/src/state.js'
 import { STATE_FILE_VERSION, restoreState, writeStateFile } from '../dist/src/persist.js'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const MAIN = join(ROOT, 'dist', 'src', 'main.js')
@@ -151,35 +152,6 @@ async function relayPort(child, timeoutMs = 5000) {
   throw new Error('没等到中继启动：' + child.lines.join('\n'))
 }
 
-// ── A 组：未认证可达的崩溃 ──────────────────────────────────────────────
-
-test('A1：被拒的连接（超出 DRC_MAX_CONNS）再发畸形帧 —— 进程不崩', async () => {
-  // 复现路径完全未认证：WS 握手不要任何凭据，只要把连接数顶满，第 N+1 条就走 rejectConnection。
-  // 旧实现那条分支直接 close() 就 return，从未挂 error 监听器；于是对端随后发一帧超
-  // maxPayload 的帧时，ws 内部的 emitErrorAndClose 会 emit('error')，
-  // **没有监听器的 EventEmitter 在这里同步抛** → uncaughtException → exit 1。
-  const child = spawnRelay({ DRC_MAX_CONNS: '1', DRC_MAX_MSG_BYTES: '2048' })
-  const sockets = []
-  try {
-    const port = await relayPort(child)
-    const url = `ws://127.0.0.1:${port}`
-    sockets.push(await connect(url))
-    const rejected = await connect(url)
-    sockets.push(rejected)
-    rejected.send('x'.repeat(16 * 1024))
-    await sleep(400)
-    assert.equal(child.exitCode, null, '中继被一帧畸形数据打死了：\n' + child.lines.join('\n'))
-    const health = await fetch(`http://127.0.0.1:${port}/healthz`).then((r) => r.json())
-    assert.equal(health.ok, true, '进程活着就该继续应答 /healthz')
-  } finally {
-    for (const ws of sockets) ws.terminate()
-    // 收场走共用装置（2026-10-08）：原来这里是"发一个 SIGTERM 就不管了"——
-    // 不等它退出，于是子进程可能在断言已经过去之后还活着；而 SIGTERM 之后
-    // 若它不走优雅停机（卡在系统调用里），这里就永远差一个 reap。
-    await stopChild(child)
-  }
-})
-
 test('A2：listen 之后 http server 再出 error —— 记一条 warn，不退出', async () => {
   // Node 的 net 层对**每次 accept 失败**（EMFILE/ENFILE/ENOBUFS）执行 server.emit('error')。
   // 而 startListening 里那个 once('error', reject) 在 listen 成功后就 off 掉了 ——
@@ -246,7 +218,9 @@ test('B2：全局配对配额用尽时每秒最多一行 warn', async () => {
   try {
     const client = await connect(ctx.url)
     sockets.push(client)
-    client.send(JSON.stringify({ t: 'hello', role: 'client', protocol: 1, clientId: 'flood-1' }))
+    client.send(
+      JSON.stringify({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, protocol: 1, clientId: 'flood-1' }),
+    )
     await until(client, (f) => f.t === 'hello-ok')
     const lines = await captureStdout(async () => {
       for (let i = 0; i < 50; i += 1) client.send(JSON.stringify({ t: 'pair-begin-client', pairingToken: '999999' }))
@@ -461,6 +435,7 @@ test('E1：状态文件里的重复 conversationId 只留一条，并计入 drop
         version: STATE_FILE_VERSION,
         savedAt: 1,
         conversations: [dup, { ...dup, clients: ['b'] }],
+        hostTokens: [],
       }),
     )
     const { log, records } = captureLog()
@@ -487,6 +462,7 @@ test('E2：盘上来自「快时钟」的未来时间戳被夹到此刻', () => 
       JSON.stringify({
         version: STATE_FILE_VERSION,
         savedAt: now,
+        hostTokens: [],
         conversations: [
           {
             conversationId: 'c_0000000000aa',
@@ -529,6 +505,7 @@ test('E3：写出来的状态文件仍然完整、可读、且没有残留临时
         {
           version: STATE_FILE_VERSION,
           savedAt: 5,
+          hostTokens: [],
           conversations: [
             { conversationId: 'c_0000000000aa', hostId: 'h1', clients: ['a'], seqHost: 0, lastActivityAt: 5 },
           ],
@@ -589,4 +566,57 @@ test('F2：--help exit 0；不认识的参数 exit 2 并给出用法', async () 
   assert.equal(bogus.code, 2, '用法错必须是 2，与运行期致命（1）区分开')
   assert.match(bogus.err, /不认识的参数/)
   assert.match(bogus.err, /用法/)
+})
+
+// ── A 组：未认证可达的崩溃 ──────────────────────────────────────────────
+
+/**
+ * ⚠️⚠️ **这一条判据摆在本文件末尾是刻意的，别"顺手整理回开头"。**
+ *
+ * ## 现象（2026-10-11 深夜实测，`node --test tests/reliability.test.mjs`）
+ *
+ * 它放在文件**头部**（第一个 `test()` 的位置，或紧跟工具函数之后）时**根本不会被注册**：
+ * 整套跑完 `# tests 19`、`# pass 19`，把这一条从源码里删掉总数**还是 19**
+ * ⇒ 它是一条**从来不跑的判据**。而同一段代码原样搬到本文件末尾就注册并通过；
+ * 换成别的文件名、换一个唯一的名字、把函数体换成 `assert.ok(true)` 都不能让它活过来。
+ *
+ * 本文件历史：这条判据自写下起就没跑过（见 2026-10-07 那轮审计的文件头），
+ * 也就是说「被拒的连接再发畸形帧会把中继打死」这个事故形状**一直没有判据罩着**。
+ *
+ * ## 触发条件：没查出来（记录在此，免得下一个人以为是自己写坏了）
+ *
+ * - 块本身是干净的：判据名全文件唯一（逐个比对过）、没有顶层 `await`、
+ *   import 无副作用（`child-harness.mjs` 只在函数体里做事）、块注释闭合正常；
+ * - 把这一个块单独放进只有 import 的文件里**会跑**；加回本文件的其余部分**就不跑**；
+ * - 所以不是"位置 1 不行"（插一个平凡判据在同一个位置能跑），也不是命名冲突。
+ *
+ * ⇒ 处置：**摆在末尾**（实测注册并通过），并在 README 的判据计数里如实记 227
+ *   （原来的 226 里躺着一条不跑的）。哪天查清了根因，再把这一节搬回 A 组开头。
+ */
+
+test('A1：被拒的连接（超出 DRC_MAX_CONNS）再发畸形帧 —— 进程不崩', async () => {
+  // 复现路径完全未认证：WS 握手不要任何凭据，只要把连接数顶满，第 N+1 条就走 rejectConnection。
+  // 旧实现那条分支直接 close() 就 return，从未挂 error 监听器；于是对端随后发一帧超
+  // maxPayload 的帧时，ws 内部的 emitErrorAndClose 会 emit('error')，
+  // **没有监听器的 EventEmitter 在这里同步抛** → uncaughtException → exit 1。
+  const child = spawnRelay({ DRC_MAX_CONNS: '1', DRC_MAX_MSG_BYTES: '2048' })
+  const sockets = []
+  try {
+    const port = await relayPort(child)
+    const url = `ws://127.0.0.1:${port}`
+    sockets.push(await connect(url))
+    const rejected = await connect(url)
+    sockets.push(rejected)
+    rejected.send('x'.repeat(16 * 1024))
+    await sleep(400)
+    assert.equal(child.exitCode, null, '中继被一帧畸形数据打死了：\n' + child.lines.join('\n'))
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`).then((r) => r.json())
+    assert.equal(health.ok, true, '进程活着就该继续应答 /healthz')
+  } finally {
+    for (const ws of sockets) ws.terminate()
+    // 收场走共用装置（2026-10-08）：原来这里是"发一个 SIGTERM 就不管了"——
+    // 不等它退出，于是子进程可能在断言已经过去之后还活着；而 SIGTERM 之后
+    // 若它不走优雅停机（卡在系统调用里），这里就永远差一个 reap。
+    await stopChild(child)
+  }
 })

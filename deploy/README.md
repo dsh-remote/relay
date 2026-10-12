@@ -20,7 +20,7 @@
 于是生产只有"拷一个文件 + 一个 env 文件"，没有 `npm install`，也就没有
 "服务器上的依赖树和 CI 不一样"这一类故障。
 
-> 完整的环境变量表、日志契约、重启语义、升级回滚见 [`../docs/SELF-HOSTING.md`](../docs/SELF-HOSTING.md)。
+> 完整的环境变量表、日志契约、重启语义、升级见 [`../docs/SELF-HOSTING.md`](../docs/SELF-HOSTING.md)。
 
 ## 从零复现
 

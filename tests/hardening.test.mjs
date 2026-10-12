@@ -16,6 +16,7 @@ import net from 'node:net'
 import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
 import { skipUnlessSignals } from './test-platform.mjs'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 const TOKEN = 'hardening-test-token-0123456789abcdef'
 const MAIN = fileURLToPath(new URL('../dist/src/main.js', import.meta.url))
@@ -137,7 +138,7 @@ test('SIGTERM：对端收到 1001，进程 exit 0（systemd 的 TimeoutStopSec �
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'term-1' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'term-1' })
     await waitFrames(peer, 1)
     const closed = peer.closed
     const code = await stopChild(server.child)
@@ -155,7 +156,7 @@ test('超大帧被 1009 切断（这是"流式输出说到一半就重连"的根
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'big-1' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'big-1' })
     await waitFrames(peer, 1)
     peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(9000) }))
     const verdict = await peer.closed
@@ -170,7 +171,7 @@ test('帧洪泛：先回一次 rate_limited，持续违规则 1008 断开', asyn
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'flood-1' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'flood-1' })
     await waitFrames(peer, 1)
     for (let i = 0; i < 400; i++) peer.send({ t: 'ping', ts: i })
     const verdict = await peer.closed
@@ -197,7 +198,7 @@ test('配对爆破：单连接用尽尝试次数后 4008 断开', async () => {
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'brute-1' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'brute-1' })
     await waitFrames(peer, 1)
     for (let i = 0; i < 6; i++) peer.send({ t: 'pair-begin-client', pairingToken: String(100000 + i) })
     const verdict = await peer.closed
@@ -214,7 +215,7 @@ test('全局配对配额：超预算必须被拒，但落到线上的 reason 必
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'quota-1' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'quota-1' })
     await waitFrames(peer, 1)
     for (let i = 0; i < 12; i++) peer.send({ t: 'pair-begin-client', pairingToken: String(200000 + i) })
     const frames = await waitFrames(peer, 12)
@@ -240,8 +241,8 @@ test('主机鉴权爆破：用尽 4001 断开', async () => {
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'host', token: 'nope-nope-nope-nope-0000000001' })
-    peer.send({ t: 'hello', role: 'host', token: 'nope-nope-nope-nope-0000000002' })
+    peer.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: 'nope-nope-nope-nope-0000000001' })
+    peer.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: 'nope-nope-nope-nope-0000000002' })
     const verdict = await peer.closed
     assert.equal(verdict.code, 4001)
   } finally {
@@ -259,7 +260,7 @@ test('连接数上限：第 maxConnections 条仍被接受，第 maxConnections+
     for (let i = 0; i < 3; i++) {
       const peer = connect(server.url)
       await peer.opened
-      peer.send({ t: 'hello', role: 'client', clientId: `cap-${i}` })
+      peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: `cap-${i}` })
       await waitFrames(peer, 1)
       kept.push(peer)
     }
@@ -354,6 +355,7 @@ test('超长自报字段不许放大日志：单行有界（P1-3）', async () =
     peer.send({
       t: 'hello',
       role: 'client',
+      protocol: PROTOCOL_VERSION,
       clientId: 'big-meta',
       clientMeta: { platform: 'x'.repeat(400 * 1024) },
     })
@@ -375,6 +377,7 @@ test('超长自报字段不许放大日志：单行有界（P1-3）', async () =
     ok.send({
       t: 'hello',
       role: 'client',
+      protocol: PROTOCOL_VERSION,
       clientId: 'max-meta',
       clientMeta: { platform: 'p'.repeat(128), label: 'l'.repeat(128) },
     })
@@ -413,7 +416,7 @@ test('待配对表有界：装满后新码得到 pair_table_full，而不是无�
   try {
     const host = connect(server.url)
     await host.opened
-    host.send({ t: 'hello', role: 'host', token: TOKEN, hostId: 'bounded' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: TOKEN, hostId: 'bounded' })
     await waitFrames(host, 1)
     for (let i = 0; i < 3; i++) host.send({ t: 'pair-begin', pairingToken: String(300000 + i) })
     await waitFrames(host, 4)
@@ -432,7 +435,7 @@ test('D2 + 零知识：info 级日志里既没有载荷明文，也没有 6 位�
     const marker = '机密指令正文-绝不该出现在服务端'
     const host = connect(server.url)
     await host.opened
-    host.send({ t: 'hello', role: 'host', token: TOKEN, hostId: 'zk1' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: TOKEN, hostId: 'zk1' })
     host.send({ t: 'pair-begin', pairingToken: '823913' })
     await waitFrames(host, 2)
 
@@ -441,6 +444,7 @@ test('D2 + 零知识：info 级日志里既没有载荷明文，也没有 6 位�
     client.send({
       t: 'hello',
       role: 'client',
+      protocol: PROTOCOL_VERSION,
       clientId: 'zkc',
       clientMeta: { platform: 'wechat-mp', label: '微信小程序' },
     })
@@ -482,7 +486,7 @@ test('debug 级才允许出现配对码，且仍然不含载荷明文', async ()
   try {
     const host = connect(server.url)
     await host.opened
-    host.send({ t: 'hello', role: 'host', token: TOKEN, hostId: 'dbg1' })
+    host.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: TOKEN, hostId: 'dbg1' })
     host.send({ t: 'pair-begin', pairingToken: '716253' })
     await waitFrames(host, 2)
     await sleep(100)
@@ -498,13 +502,13 @@ test('同一 hostId 顶号：旧 socket 收到 4000，会话与已配对的客�
   try {
     const hostA = connect(server.url)
     await hostA.opened
-    hostA.send({ t: 'hello', role: 'host', token: TOKEN, hostId: 'same' })
+    hostA.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: TOKEN, hostId: 'same' })
     await waitFrames(hostA, 1)
     hostA.send({ t: 'pair-begin', pairingToken: '500100' })
     await waitFrames(hostA, 2)
     const client = connect(server.url)
     await client.opened
-    client.send({ t: 'hello', role: 'client', clientId: 'survivor' })
+    client.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'survivor' })
     await waitFrames(client, 1)
     client.send({ t: 'pair-begin-client', pairingToken: '500100' })
     await waitFrames(client, 2)
@@ -512,7 +516,7 @@ test('同一 hostId 顶号：旧 socket 收到 4000，会话与已配对的客�
 
     const hostB = connect(server.url)
     await hostB.opened
-    hostB.send({ t: 'hello', role: 'host', token: TOKEN, hostId: 'same' })
+    hostB.send({ t: 'hello', role: 'host', protocol: PROTOCOL_VERSION, token: TOKEN, hostId: 'same' })
     const replaced = await hostA.closed
     assert.equal(replaced.code, 4000)
     await waitFrames(hostB, 1)
@@ -602,7 +606,7 @@ test('默认上限 1MB：图片附件那一跳的余量（wire 1.3.0 起一条 p
   try {
     const peer = connect(server.url)
     await peer.opened
-    peer.send({ t: 'hello', role: 'client', clientId: 'big-2' })
+    peer.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'big-2' })
     await waitFrames(peer, 1)
     // 900KB：一张压过的 jpeg（base64 之后）完全放得下——不许切
     peer.ws.send(JSON.stringify({ t: 'ping', ts: 'x'.repeat(900 * 1024) }))

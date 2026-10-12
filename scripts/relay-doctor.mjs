@@ -92,10 +92,6 @@ const READ = [
   'stateWriteFailures',
   'shuttingDown',
   'protocolSelf',
-  'protocolMin',
-  'peerProtocolMin',
-  'peerProtocolMax',
-  'peersNoProtocol',
 ]
 const pick = (src) => Object.fromEntries(READ.filter((k) => src[k] !== undefined).map((k) => [k, src[k]]))
 
@@ -191,13 +187,9 @@ async function main() {
     )
   }
 
-  // ⑤ 协议版本协商
+  // ⑤ 协议版本（单版本制：只有"本端说的是哪一版"可看）
   if (health.protocolSelf !== undefined) {
-    const line = `协议：本端 v${health.protocolSelf}，接受 [${health.protocolMin ?? '?'} …]，对端最小 ${health.peerProtocolMin ?? '—'} / 最大 ${health.peerProtocolMax ?? '—'}`
-    report('info', line)
-    if (Number(health.peersNoProtocol) > 0) {
-      report('warn', `有 ${health.peersNoProtocol} 个对端没报协议版本`, '老版本客户端；该升')
-    }
+    report('info', `协议：本端 v${health.protocolSelf}（三端必须同版本；不相等的一端会在握手上被拒）`)
   }
 
   print()

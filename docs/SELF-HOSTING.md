@@ -236,25 +236,22 @@ node scripts/relay-doctor.mjs --url http://127.0.0.1:8787
 | `lastPingAgo`        | number | ✅ 契约      | **秒**。距上一次保活 ping 扫描多久；`-1` = 还没扫过。单位是秒不是毫秒，看指标时别按 ms 判                                                                                                           |
 | `shutdownForced`     | number | ✅ 契约      | 累计：5 秒兜底强退的次数。**注意它结构上永远读到 0**（加一之后紧接着就是 `exit(0)`，没人来得及 curl）——要分辨"排空 vs 强退"请看 §9.1 的那两行 warn 日志                                             |
 | `shuttingDown`       | bool   | ✅ 契约      | 收到 SIGTERM/SIGINT 后置位                                                                                                                                                                          |
-| `protocolSelf`       | number | ✅ 契约      | 本中继实现的协议版本（= `PROTOCOL_VERSION`）。收到超出 `[protocolMin, protocolSelf]` 的 `hello` 会被拒（`unsupported_protocol`）                                                                    |
-| `protocolMin`        | number | ✅ 契约      | 本中继能接受的**最低**对端协议版本。低于它按"太旧"拒；**等于 1** 时表示任何现存版本都能连（加性演进）                                                                                               |
-| `peerProtocolMin`    | number | ✅ 契约      | 当前已连上对端报的**最小**协议版本；`-1` = 现在没有对端。**这一项是排查"某个客户端连不上"的第一站**                                                                                                 |
-| `peerProtocolMax`    | number | ✅ 契约      | 当前已连上对端报的**最大**协议版本；`-1` = 现在没有对端。出现比 `protocolSelf` 更大的值说明有对端在说本中继听不懂的版本（那一次握手就会被拒，所以它不该出现在这里）                                 |
-| `peersNoProtocol`    | number | ✅ 契约      | 已连上但**没报**协议版本的对端数（规范 V1 的老端点，例如旧版本小程序）。它们**照常放行**——这个数只是观测，不是错误                                                                                  |
+| `protocolSelf`       | number | ✅ 契约      | 本中继实现的协议版本（= `PROTOCOL_VERSION`）。任一端报的版本与它**不相等**（含没报）都会被拒（`unsupported_protocol`），并关连接（1002）                                                            |
 
-这 23 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
+这 19 个字段就是运维契约；前三类是**瞬时快照**（会上下浮动），`droppedFrames`/`slowConsumers`/
 `rejectedPairs`/`shutdownForced`/`stateWrites`/`stateWriteFailures` 是**累计计数**（只增不减），混在一起会让"手机不更新"这类排查分不清
 "现在是空的"和"一直送不出去"。 **[已验证：`curl` 实测响应 + 代码 `health()`]**
 
-> **协议版本那五项为什么要有**（2026-10-07）：`hello.protocol` 这个字段从第一天就在线上，
-> 而**在此之前没有任何一端校验过它**——中继照常回 `hello-ok`，两端都不看。
-> 于是协议不兼容的现场表现是"连上了、界面正常、什么都不发生"，没有一层会报错。
-> 现在中继在 `handleFrame` 最前面设了闸（判定委托协议层的 `negotiateProtocol`，
-> 中继自己不写版本区间），并在 `/healthz` 报出对端的版本跨度。
+> **`protocolSelf` 为什么要有**（2026-10-07 引入，2026-10-11 晚收敛）：`hello.protocol`
+> 这个字段从第一天就在线上，而**在此之前没有任何一端校验过它**——中继照常回 `hello-ok`，
+> 两端都不看。于是协议不兼容的现场表现是"连上了、界面正常、什么都不发生"，没有一层会报错。
+> 现在中继在 `hello` 那一刻设了闸（判定委托协议层的 `negotiateProtocol`），
+> `/healthz` 报出本端版本 ⇒ 排障第一件事就是确认"这一端说的是哪一版"。
 >
-> `peersNoProtocol` 值得单独说一句：它**不是**故障。规范 V1 规定"对端不报就按 1 处理"，
-> 而今天的小程序恒发 1；一个只接老版本的真机环境里这个数会长期大于 0，
-> 属正常。它与 `peerProtocolMin` 分开报，正是为了让人能区分"老版本"与"版本对不上"。
+> ⚠️ 原来还有 `protocolMin` / `peerProtocolMin` / `peerProtocolMax` / `peersNoProtocol`
+> 四个字段（报对端的版本**分布**）。**单版本制之后它们没有意义**：对端只能报本端版本，
+> 否则在握手那一步就被拒——不存在"分布"。四个字段与那套计数机制（`Peer.protocol` /
+> `countedProtocol` 闩锁）在 2026-10-11 晚间一并删除。
 
 > 本节此前写作"八个字段"并断言 `lastPingAgo`/`droppedFrames`/`slowConsumers` **不存在**——
 > 那是在 C0 压测装置拿这三类字段做过采样之后被推翻的：响应里一直都有，
@@ -745,9 +742,7 @@ v3 为此把停机做成了**可显式调用的出口**（`src/lifecycle.ts`）�
 
 ---
 
-## 10. 升级与回滚
-
-### 10.1 升级（三条命令）
+## 10. 升级
 
 ```sh
 pnpm build
@@ -757,63 +752,14 @@ curl -s https://drc.example.com/healthz       # version 必须是新版本，不
 ```
 
 `relay.mjs` 旁边没有 `package.json`，也没有 `node_modules`：**升级就是替换一个文件**。
-未配 `DRC_STATE_FILE` 落盘时重启会丢掉全部配对关系（§6），所以挑一个没人正在用手机的时刻；主机与手机会各自重连回来。
+未配 `DRC_STATE_FILE` 落盘时重启会丢掉全部配对关系（§6），所以挑一个没人正在用手机的时刻；
+主机与手机会各自重连回来。
 
-### 10.2 回滚必须**成对**：中继产物 + 主机插件产物
-
-**不能只回滚中继一边**，因为两侧握手是双向不兼容的（帧名与 `psk` 字段在两代之间都动过）：
-
-| 组合             | 结果                                                           | 为什么                                                                                                                        |
-| ---------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| 新 host + 旧中继 | **配对永远不成功**                                             | 新 host 发的 `pair-begin` **不带 `psk`**（PSK 从不上网），旧中继要求 `psk` 字段，缺了即 `error{bad_pair}`                     |
-| 旧 host + 新中继 | **静默不上线**：插件的 `relay` 一直停在 `connecting`，也不报错 | 握手那一帧在新一代换了名字，新中继的判别联合里没有旧帧名 → 回 `error{unknown_frame}` → 旧插件把它丢掉，于是永远等不到注册成功 |
-
-关于"zod 默认 strip 多余字段"要说准：它只保证**字段级**的向前兼容——旧 host 的
-`pair-begin{psk}` 确实能被新中继解析（多余的 `psk` 键被剥掉，不报错）。但它救不了
-**帧名级**的断掉：握手那一帧换了名字，所以"旧 host + 新中继 兼容"在实践中不成立。
-这一条是读代码 + 复核记录得出的，**没有真的把旧产物起来做过双向对拍**，属于[未实测]；
-但结论可以照用，因为回滚两侧成对走本来就不需要依赖它。
-
-小程序侧不受影响：`mp/` 冻结，它只发 `hello` / `pair-begin-client` / `enc` 三种控制帧
-（两代中继都认），**回滚不涉及小程序发版**。
-
-### 10.3 回滚步骤
-
-先把每次上线的两个产物按版本号存下来：
-
-```sh
-# 升级前，先备份现网正在跑的两个文件
-mkdir -p ~/drc-backup
-ssh root@HOST 'cp /opt/dsh-remote-control/server/relay.mjs /opt/dsh-remote-control/server/relay.mjs.prev'
-cp ~/.dsh/profiles/desktop/node_modules/dsh-remote-control/index.js ~/drc-backup/plugin-index.js.prev
-```
-
-回滚 = 两份一起退：
-
-```sh
-# 1) 中继
-scp <上一版>/relay.mjs root@HOST:/opt/dsh-remote-control/server/relay.mjs
-ssh root@HOST 'systemctl restart dsh-remote-control'
-curl -s https://drc.example.com/healthz       # version 回到上一版
-
-# 2) 主机插件：装回上一版单文件，然后重启 DSH
-cp ~/drc-backup/plugin-index.js.prev ~/.dsh/profiles/desktop/node_modules/dsh-remote-control/index.js
-osascript -e 'tell application "DeepSeek Harness" to quit'; sleep 6; open -a "DeepSeek Harness"
-```
-
-只退一边会留下上表里的某一行：只退中继 = 配对永远不成功；只退插件 = 主机静默不上线。
-两种都比"照着清单多按一次"贵得多，所以两份必须一起动。
-
-> 用 `cp` 直接换 `index.js` 时，同目录那份由安装脚本生成的 `package.json`
-> 里写的还是新版本号——顺手改回去，否则状态快照与宿主日志会报一个对不上的版本。
-
-### 10.4 回滚之后的验收
-
-别只 `curl /healthz`：那只证明进程活着。回滚验收要**做一次真配对**：出码 → 手机扫码 →
-手机上出现会话列表 → `/healthz` 的 `hosts`、`clients`、`conversations` 各加 1 →
-发一条指令拿到流式回复。 **[未实测]**
-
----
+> ⚠️ 2026-10-11 晚：这一节原来叫「升级与回滚」，里面有 §10.2「回滚必须**成对**」、
+> §10.3 回滚步骤、§10.4 回滚验收，以及一张"两代之间帧名/字段都动过"的兼容矩阵。
+> 没有真实用户、三端同版本发版 ⇒ **整节删除**：升级就是把三端升到同一版本，
+> 落后的一端会在 `hello` 那一刻被明确拒掉（`unsupported_protocol`），
+> 而不是以"连上了但什么都不发生"的形式悄悄降级。
 
 ## 11. 哪些已在生产实例上验证过
 
@@ -833,7 +779,7 @@ systemd 那份单元、优雅停机与重启后 `unknown_session` 的行为（�
 
 **没有实测、只是照代码写的**：Caddy 反代、launchd 常驻、Docker 部署、
 `journalctl -p warning` 的实际过滤效果（§5.3）、停机窗口的探针行为（§4）、
-双向兼容矩阵的真实对拍（§10.2）、回滚后的真配对验收（§10.4）。
+逐端版本对齐后的真配对验收（§10）。
 
 ---
 

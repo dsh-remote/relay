@@ -19,7 +19,7 @@
  * 因为要验的恰恰是"它接在**正确的位置**"，而内部函数调不到位置。
  *
  * 四条，各自钉一个方向：
- * 1. **老端点照常连上**（不报 protocol / 报 1）—— 这一闸不能误伤现网（V1）；
+ * 1. **没报 protocol 一律拒**（单版本制：删掉了"缺省视为 1"那条容忍）；
  * 2. **太新的版本被拒，且给的是中文** —— 拒了只是���半，"说清为什么"才是另一半，
  *    而这句话会**原样弹到用户手机上**（见下面第 4 条）；
  * 3. **拒的是连接而不是静默接受** —— close code 用 1002（协议错误），
@@ -33,6 +33,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 import WebSocket from 'ws'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 import { createRelay } from '../dist/src/server.js'
 import { loadConfig } from '../dist/src/config.js'
 
@@ -111,25 +112,28 @@ function sayHello(url, hello, { waitClose = false } = {}) {
   })
 }
 
-test('老端点照常连上：不报 protocol（V1）与报 1 都必须放行', async () => {
-  // 这一条是**现网的安全线**：`MIN_SUPPORTED_PROTOCOL === PROTOCOL_VERSION === 1`，
-  // 而今天的小程序恒发 1、极老版本连字段都不发。任何"闸一加就把现网掐断"的实现
-  // 都会在这里红 —— 而那恰恰是最坏的一类回归（本地全链路与 e2e 用的是真小程序代码，
-  // 它们一定会报 protocol=1，所以**只有不带字段的那条路径**需要单独钉）。
+test('**没报 protocol 一律拒**（单版本制：没有"缺省视为 1"那条容忍）', async () => {
+  /**
+   * ⚠️ 2026-10-11 晚：这条原来钉的是"不报 protocol（V1）也照常放行"。
+   * 三端同版本发版、没有老用户 ⇒ 那条容忍被删掉，判据翻过来：
+   * 缺版本字段 = 形状坏（`hello.protocol` 在 schema 里是**必填**），
+   * 而"两个版本的端"再也不会以"连上了、什么都不发生"的形式撞在一起。
+   */
   const { relay, url } = await startRelay()
   try {
+    // 前置：报了版本的照常握手（否则下面那条会因为别的原因红）
+    const ok = await sayHello(url, { t: 'hello', role: 'client', clientId: 'v1-explicit', protocol: PROTOCOL_VERSION })
+    assert.equal(ok.frames[0]?.t, 'hello-ok', `报了版本就该放行，实际 ${JSON.stringify(ok.frames)}`)
+
     for (const hello of [
-      { t: 'hello', role: 'client', clientId: 'v1-nofield' },
-      { t: 'hello', role: 'client', clientId: 'v1-explicit', protocol: 1 },
-      { t: 'hello', role: 'host', token: TOKEN, protocol: 1 },
+      { t: 'hello', role: 'client', clientId: 'nofield-1' },
       { t: 'hello', role: 'host', token: TOKEN },
     ]) {
-      const r = await sayHello(url, hello)
-      assert.equal(
+      const r = await sayHello(url, hello, { waitClose: true })
+      assert.notEqual(
         r.frames[0]?.t,
         'hello-ok',
-        `这份 hello 应当照常握手成功（role=${hello.role}, protocol=${String(hello.protocol)}），` +
-          `实际收到 ${JSON.stringify(r.frames)}。闸若在这里拒绝，现网就断了。`,
+        `缺 protocol 的 hello 不许握手成功（role=${hello.role}）：${JSON.stringify(r.frames)}`,
       )
     }
   } finally {
@@ -198,8 +202,8 @@ test('版本闸只挡 hello：业务帧不带该字段，不该被当成"没报�
   // 其实是**错配**：一个报 999 已被拒的连接，它的业务帧也该被拒；而
   // 一个真报 2 的主机（若将来 own 抬到 2）在发 `enc` 时会被当成 1 而**错误放行**。
   //
-  // 所以连接上必须记住那一次的判定结果（`Peer.protocol`）。这条钉住"记了"：
-  // 握手成功之后再发一条不带版本的 `ping`，必须照常回 `pong`（而不是被判版本不符）。
+  // 所以闸**只**在 `hello` 那一帧判一次。这条钉住它：握手成功之后再发一条不带版本的
+  // `ping`，必须照常回 `pong`（而不是被当成"没报版本"拒掉）。
   const { relay, url } = await startRelay()
   try {
     const ws = new WebSocket(url)
@@ -231,17 +235,17 @@ test('版本闸只挡 hello：业务帧不带该字段，不该被当成"没报�
   }
 })
 
-test('登记了的版本能在 /healthz 里看到（"没报"与"报了 1"要能分开）', async () => {
-  // 观测面：`Peer.protocol` 存的是**原始值**（不报就是 undefined），
-  // 而不是在闸里按 1 处理后的结果 —— 否则"没报"与"报了 1"在排障时长得一样，
-  // 而这两者要区分（前者是老版本小程序）。
-  const { relay, url } = await startRelay()
+test('单版本制下 /healthz 仍要能一眼看到"这个中继说的是哪一版"', async () => {
+  // ⚠️ 2026-10-11 晚：`peerProtocolMin` / `peerProtocolMax` / `peersNoProtocol` 三个观测字段
+  // 随版本协商一起删掉了（对端只能报本端版本，否则在握手那一步就被拒 —— 没有"分布"可看）。
+  // 留下的是 `protocolSelf`：版本对不上的现场表现是"连上了、什么都不发生"，
+  // 排障时第一件事就是确认这一端说的是哪一版。
+  const { relay } = await startRelay()
   try {
-    await sayHello(url, { t: 'hello', role: 'client', clientId: 'nofield' })
     const h = relay.health()
-    // 只要求字段存在且可读，不钉具体字段名（那是内部形状）；这里钉的是"这一项被记下来了"
-    const flat = JSON.stringify(h)
-    assert.match(flat, /protocol/i, `/healthz 里没有任何协议版本相关的观测字段：${flat}`)
+    assert.equal(h.protocolSelf, PROTOCOL_VERSION, `protocolSelf 应当是本端版本：${JSON.stringify(h)}`)
+    assert.equal('peerProtocolMin' in h, false, '版本分布的观测字段已经删掉')
+    assert.equal('peersNoProtocol' in h, false, '同上')
   } finally {
     await relay.close()
   }

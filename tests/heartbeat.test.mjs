@@ -21,6 +21,7 @@ import crypto from 'node:crypto'
 import WebSocket from 'ws'
 import { createRelay } from '../dist/src/server.js'
 import { loadConfig } from '../dist/src/config.js'
+import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 
 /** 一眼假的 token；测试里绝不用真实凭据。 */
 const TOKEN = 'unit-test-host-token-0123456789abcdef'
@@ -53,7 +54,7 @@ async function pingingClient(url, id) {
     ws.once('error', reject)
   })
   ws.on('ping', () => stamps.push(Date.now()))
-  ws.send(JSON.stringify({ t: 'hello', role: 'client', clientId: id, protocol: 1 }))
+  ws.send(JSON.stringify({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: id, protocol: 1 }))
   return { ws, stamps }
 }
 
@@ -150,7 +151,16 @@ test('表清扫仍按 sweepMs 跑：配对码不会跟着心跳周期一起变�
       ws.once('open', resolve)
       ws.once('error', reject)
     })
-    ws.send(JSON.stringify({ t: 'hello', role: 'host', token: TOKEN, hostId: 'hb-pair-host', protocol: 1 }))
+    ws.send(
+      JSON.stringify({
+        t: 'hello',
+        role: 'host',
+        protocol: PROTOCOL_VERSION,
+        token: TOKEN,
+        hostId: 'hb-pair-host',
+        protocol: 1,
+      }),
+    )
     await new Promise((resolve) => ws.once('message', resolve))
     ws.send(JSON.stringify({ t: 'pair-begin', pairingToken: '246813' }))
     await sleep(60)

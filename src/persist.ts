@@ -54,9 +54,16 @@ import { CONVERSATION_ID_PREFIX } from '@dsh-remote/protocol/ids'
 import type { Log } from './log.js'
 import type { Conversation, RelayState } from './state.js'
 
-/** 落盘格式版本。**不认识就整份按空处理**（而不是尽力解析）——猜错字段的读法会把
- * 一份好状态读成坏状态，那种"看起来起来了、其实是空表"的故障比直接报错难查得多。 */
-export const STATE_FILE_VERSION = 1
+/**
+ * 落盘格式版本。**不认识就整份按空处理**（而不是尽力解析）——猜错字段的读法会把
+ * 一份好状态读成坏状态，那种"看起来起来了、其实是空表"的故障比直接报错难查得多。
+ *
+ * ⚠️ `2`（2026-10-11 晚）：`hostTokens` 从"可选、老文件当空表"变成**必需字段**。
+ * 没有老用户，所以**不为 v1 文件保留任何读取路径** —— 旧文件一律读成空表并留一条 warn
+ * （配对要重新扫，令牌要重新认领）。升版本的代价只是"升级后第一次启动是空的"，
+ * 而留着 v1 分支的代价是永远要维护两种格式 + 一条"老文件静默清空令牌"的路。
+ */
+export const STATE_FILE_VERSION = 2
 
 export interface PersistedConversation {
   conversationId: string
@@ -69,7 +76,7 @@ export interface PersistedConversation {
 }
 
 export interface PersistedHostToken {
-  /** `''` = 未绑定槽位（见 `state.ts` 的 `HostTokenEntry`）。**只有这一条允许空**。 */
+  /** 非空 hostId（2026-10-11 晚起没有"未绑定槽位"了，见 `state.ts` 的 `HostTokenEntry`）。 */
   hostId: string
   token: string
   issuedAt: number
@@ -80,17 +87,8 @@ export interface PersistedState {
   version: number
   savedAt: number
   conversations: PersistedConversation[]
-  /**
-   * 按 hostId 一机一枚的令牌表（2026-10-11 起）。
-   *
-   * **可选**：旧文件里没有这个字段，读成空表——那台中继的行为就与 3.1.2 一致
-   * （只有 env 那枚可以用）。刻意**不**升 `version`：`conversations` 的形状没变，
-   * 而升版本会让旧中继把新文件**整份丢掉**（丢的不只是令牌，还有所有人的配对）。
-   * 反过来（旧中继读到新文件）它会忽略这个字段并在下次落盘时**把它抹掉** ⇒
-   * 回滚 = 所有按主机的令牌失效、主机侧因为"盘上有 token 就不再认领"而**不会自愈**。
-   * 这条回滚代价写在 `deploy/README.md` 里，别当它不存在。
-   */
-  hostTokens?: PersistedHostToken[]
+  /** 按 hostId 一机一枚的令牌表（v2 起是**必需字段**，见 `STATE_FILE_VERSION`）。 */
+  hostTokens: PersistedHostToken[]
 }
 
 /** 路由凭证的形状由 `newConversationId()` 定死（`c_` + 12 位 hex）。读进来先按它筛一遍。 */
@@ -108,8 +106,7 @@ const HOST_TOKEN_RE = /^[0-9a-f]{48}$/
 const MAX_HOST_ID_LEN = 200
 
 /** 逐条筛令牌表。与会话表同一套纪律：坏一条丢一条并计数，不整份作废。 */
-function sanitizeHostTokens(raw: unknown): { hostTokens: PersistedHostToken[]; dropped: number } {
-  if (!Array.isArray(raw)) return { hostTokens: [], dropped: 0 }
+function sanitizeHostTokens(raw: unknown[]): { hostTokens: PersistedHostToken[]; dropped: number } {
   const hostTokens: PersistedHostToken[] = []
   const seen = new Set<string>()
   for (const item of raw) {
@@ -119,8 +116,12 @@ function sanitizeHostTokens(raw: unknown): { hostTokens: PersistedHostToken[]; d
     const entry = item as Record<string, unknown>
     if (
       typeof entry.hostId !== 'string' ||
+      // ⚠️ **空 hostId 一律丢**（2026-10-11 晚）：那曾是"未绑定槽位"的键，而它的令牌
+      // 对任意主机都算数。旧状态文件里可能真有一条这样的记录 —— 读进来就等于把
+      // 那把万能钥匙又装回内存，所以在这一层直接筛掉（不是靠 `hostTokenAccepted` 单独兜）。
+      entry.hostId === '' ||
       entry.hostId.length > MAX_HOST_ID_LEN ||
-      (entry.hostId !== '' && entry.hostId.trim() !== entry.hostId) ||
+      entry.hostId.trim() !== entry.hostId ||
       !isNonEmptyString(entry.token) ||
       !HOST_TOKEN_RE.test(entry.token) ||
       !isTimestamp(entry.issuedAt) ||
@@ -241,7 +242,15 @@ export function readStateFile(path: string, log: Log): PersistedState | undefine
 
   const { conversations, dropped } = sanitize(file.conversations)
   if (dropped > 0) log.warn('state file entries dropped', { path, dropped, kept: conversations.length })
-  // 旧文件（3.1.2 及更早）没有 hostTokens 字段 ⇒ 空表，行为退回"只有 env 那枚"。
+  /**
+   * ⚠️ `hostTokens` 是**必需字段**（v2 起）：没有它就说明这份文件不是这一版写的
+   * —— 而版本闸在上面已经把它拦掉了。不再有"老文件没有这个键 ⇒ 当空表"那条路：
+   * 那等于让一台老中继写下的文件悄悄把所有人的令牌清空。
+   */
+  if (!Array.isArray(file.hostTokens)) {
+    log.warn('state file has no hostTokens array, starting empty', { path })
+    return undefined
+  }
   const hostTokenResult = sanitizeHostTokens(file.hostTokens)
   if (hostTokenResult.dropped > 0) {
     log.warn('state file host tokens dropped', {
@@ -256,15 +265,12 @@ export function readStateFile(path: string, log: Log): PersistedState | undefine
     dropped,
     hostTokens: hostTokenResult.hostTokens.length,
   })
-  const restored: PersistedState = {
+  return {
     version: STATE_FILE_VERSION,
     savedAt: isTimestamp(file.savedAt) ? file.savedAt : 0,
     conversations,
+    hostTokens: hostTokenResult.hostTokens,
   }
-  // 只在有货时才带这个键：空表落盘成 `hostTokens: []` 没意义，而且会让
-  // "旧文件 ↔ 快照"的对比测试读到多余的字段。
-  if (hostTokenResult.hostTokens.length > 0) restored.hostTokens = hostTokenResult.hostTokens
-  return restored
 }
 
 /** 把内存表摊平成落盘形状。**只取白名单字段**（见 PersistedConversation）。 */
@@ -285,10 +291,8 @@ export function snapshotState(state: RelayState, now: number): PersistedState {
   for (const [hostId, entry] of state.hostTokens) {
     hostTokens.push({ hostId, token: entry.token, issuedAt: entry.issuedAt, lastUsedAt: entry.lastUsedAt })
   }
-  const snapshot: PersistedState = { version: STATE_FILE_VERSION, savedAt: now, conversations }
-  // 同样只在有货时才带：空表不写字段，落盘形状与 3.1.2 逐字一致（回滚友好 + 测试稳定）。
-  if (hostTokens.length > 0) snapshot.hostTokens = hostTokens
-  return snapshot
+  // 空表也照写（v2：字段必需，形状只有一种）。
+  return { version: STATE_FILE_VERSION, savedAt: now, conversations, hostTokens }
 }
 
 /**
@@ -354,7 +358,7 @@ export function restoreState(path: string, state: RelayState, log: Log, now: num
    * **不夹时间戳**（与会话那几处刻意不同）：`issuedAt` / `lastUsedAt` 只用于诊断与
    * 裁剪顺序，不参与任何"过期"判定——夹了反而会掩盖"这台机器的钟不对"。
    */
-  for (const entry of file.hostTokens ?? []) {
+  for (const entry of file.hostTokens) {
     state.hostTokens.set(entry.hostId, {
       token: entry.token,
       issuedAt: entry.issuedAt,

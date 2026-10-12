@@ -21,7 +21,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import { type EndpointFrame, type ErrorCode, type RelayFrame } from '@dsh-remote/protocol/frames'
 import { newHostId } from '@dsh-remote/protocol/ids'
-import { negotiateProtocol, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
+import { negotiateProtocol, PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 import { wantsRetryAfter } from '@dsh-remote/protocol/errors'
 import {
   encBatchToClient,
@@ -43,7 +43,7 @@ import type { RelayConfig } from './config.js'
 import { BackpressureGate, Budget, FrameRateGate } from './limits.js'
 import { Log, REDACTED } from './log.js'
 import { restoreState, snapshotState, writeStateFile } from './persist.js'
-import { RelayState, UNBOUND_HOST_TOKEN_KEY, WS_OPEN, type Sock } from './state.js'
+import { RelayState, WS_OPEN, type Sock } from './state.js'
 
 /** 保留的自定义关闭码：同 hostId 顶号。客户端的重连策略不认识它，只对主机有意义。 */
 const CLOSE_REPLACED = 4000
@@ -114,29 +114,6 @@ interface Peer {
    * **之后不再变**——所以一个对端两次被 ping 的间隔稳定等于 pingIntervalMs。
    */
   pingBucket: number
-  /**
-   * 对端在 `hello` 里报的协议版本（`undefined` = 没报，按 1 处理，V1）。
-   *
-   * ⚠️ 它**只喂 `/healthz` 的观测**（`peerProtocolMin` / `peerProtocolMax` /
-   * `peersNoProtocol`），**不参与任何判定**——决定"放不放行"的那一次判定发生在
-   * `hello` 上，见 `acceptProtocol` 的注释。
-   *
-   * 曾经这里写着"必须在连接上记，否则业务帧会被当成没报版本"——那是把**没发生的
-   * 事**写成了理由：业务帧从来不跑那道闸，所以不存在"被当成 1"这回事。
-   */
-  protocol?: number
-  /**
-   * 这条连接**已经往 `peerProtocols` / `peersWithoutProtocol` 里记过一次**没有。
-   *
-   * 为什么需要它：观测面的计数必须以**连接**为单位（`close` 天然每条连接减一次），
-   * 而 `hello` 可以来很多次（re-hello 是设计内行为，见 `releaseIdentityFor`）。
-   * 没有这个闩锁时每收一个 `hello` 就 +1，于是 N 次 hello 只抵消 1 次断开，
-   * `peerProtocols.size === 0`（"当前没有对端"）这条判据永久失效。
-   *
-   * 它与 `protocol !== undefined` **不是一回事**：一个**没报版本**的连接
-   * `protocol` 恒为 undefined，而它同样要往 `peersWithoutProtocol` 里记一次。
-   */
-  countedProtocol: boolean
 }
 
 export interface RelayHandle {
@@ -222,29 +199,24 @@ export function createRelay(config: RelayConfig): RelayHandle {
   /**
    * 这枚令牌能不能代表 `hostId` 连上来。
    *
-   * 三条来源，任一命中即可（全是定长比较，别把长度或时序泄露出去）：
+   * 两条来源，任一命中即可（全是定长比较，别把长度或时序泄露出去）：
    *
    * ① **该 hostId 自己那枚** —— `POST /api/claim-token` 领来的（2026-10-11 起的模型）。
-   * ② **未绑定槽位**那枚 —— 3.1.2 及更早的插件认领时不带 hostId，落在那里；
-   *    它保持"对谁都算数"的旧语义，**但认领它再也动不了 ①**，于是老客户端互相顶掉时
-   *    新客户端不受影响。
-   * ③ **env 里的 `DRC_HOST_TOKEN`** —— 运维引导凭据。它**永不参与轮换**，所以
+   * ② **env 里的 `DRC_HOST_TOKEN`** —— 运维引导凭据。它**永不参与轮换**，所以
    *    "任何陌生人 POST 一次就能把合法主机永久踢下线"这条没了。
    *
+   * ⚠️ 这里**没有**"未绑定槽位"那条兼容路径了（2026-10-11 晚，用户裁决不做老客户端兼容）：
+   * 它的令牌对任意 hostId 都算数，等于给"冒充任何主机"留了一把万能钥匙，
+   * 而认领接口是**无认证**的。现在认领必须带 hostId（见 `handleClaimToken`）。
+   *
    * 成功时打一个"刚用过"的时间戳：裁剪令牌表时按它排序，先丢的永远是没人用的占位条目
-   * （签得早但一直在用的机器不该被丢，丢了它**不会自愈**）。
+   * （签得早但一直在用的机器不该被丢，丢了它要靠自愈才回得来）。
    */
   function hostTokenAccepted(hostId: string, got: string | undefined): boolean {
     if (!got) return false
-    const now = Date.now()
     const perHost = state.hostTokens.get(hostId)
     if (perHost && tokenMatches(perHost.token, got)) {
-      state.markHostTokenUsed(hostId, now)
-      return true
-    }
-    const unbound = state.hostTokens.get(UNBOUND_HOST_TOKEN_KEY)
-    if (unbound && tokenMatches(unbound.token, got)) {
-      state.markHostTokenUsed(UNBOUND_HOST_TOKEN_KEY, now)
+      state.markHostTokenUsed(hostId, Date.now())
       return true
     }
     return config.hostToken !== '' && tokenMatches(config.hostToken, got)
@@ -582,36 +554,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
   }
 
   function handleHello(peer: Peer, frame: Extract<EndpointFrame, { t: 'hello' }>): void {
-    // 版本闸已经放过这一帧（`handleFrame` 最前面），这里**只把版本记在连接上**，
-    // 让后续那些不带该字段的帧仍按对端的真实版本判定（见 `Peer.protocol` 的注释）。
-    // 记 `frame.protocol` 而不是判定的结果：不报字段的老端点在闸里按 1 处理，
-    // 这里也要存成 `undefined` 而不是 1 —— 否则 `/healthz` 会把"没报"说成"报了 1"。
-    //
-    // ⚠️ 计数**只在第一次 hello 时记**（2026-10-07 修）。re-hello 是设计内行为
-    // （换身份，见 releaseIdentityFor），而原来每收一个 `hello` 就 +1、`close` 只 −1
-    // —— 于是 N 次 hello 只抵消 1 次，`peerProtocols.size === 0`（"当前没有对端"）
-    // 这条判据**永久失效**，未认证对端单连接发 500 个 hello（帧闸 500/s 全放行）
-    // 就能把计数推高 500。
-    //
-    // 正确形状是"**连接**记一次"，而 `close` 天然每条连接只减一次 —— 两边同口径。
-    // 版本变了（re-hello 报了另一个 protocol）时先减旧的那个再加新的，那才是
-    // "这条连接此刻报的版本"在计数表里的位置。
-    if (peer.protocol === undefined && !peer.countedProtocol) {
-      peer.countedProtocol = true
-      if (frame.protocol === undefined) peersWithoutProtocol++
-      else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
-    } else if (peer.protocol !== frame.protocol) {
-      // 同一条连接换了版本：把旧的那个减掉。
-      if (peer.protocol === undefined) peersWithoutProtocol = Math.max(0, peersWithoutProtocol - 1)
-      else {
-        const left = (peerProtocols.get(peer.protocol) ?? 1) - 1
-        if (left > 0) peerProtocols.set(peer.protocol, left)
-        else peerProtocols.delete(peer.protocol)
-      }
-      if (frame.protocol === undefined) peersWithoutProtocol++
-      else peerProtocols.set(frame.protocol, (peerProtocols.get(frame.protocol) ?? 0) + 1)
-    }
-    peer.protocol = frame.protocol
     if (frame.role === 'host') {
       // hostId 要**先**算出来：按 hostId 一机一枚之后，它是查令牌的键。
       const hostId = frame.hostId?.trim() || newHostId()
@@ -861,21 +803,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
   }
 
   let lastResyncPersistAt = 0
-  /**
-   * 已连上的对端各自报的协议版本 → **计数**（`/healthz` 的观测面，见 health()）。
-   *
-   * ## 为什么是 Map<版本, 计数> 而不是 Set<版本>
-   *
-   * 连接会断开，而两个对端**可以报同一个版本**（现网所有小程序都是 1）。
-   * `Set` 只能加不能减 ⇒ 要么在断开时删掉那个版本（于是把仍在连接的另一个对端
-   * 也一起抹了，`peerProtocolMin` 忽然变成 -1），要么留着不动（**无界增长** ——
-   * 那正是「客户端身份键无界泄漏」那条事故的形状，不能在观测面上重犯）。
-   *
-   * 所以按版本计数：断开时减一，归零时删键。`peerProtocols.size === 0` 就是
-   * "当前没有对端"的判据，语义干净。
-   */
-  const peerProtocols = new Map<number, number>()
-  let peersWithoutProtocol = 0
 
   /**
    * 协议版本闸（规范 §5.2 V3；GAP-2）。
@@ -895,10 +822,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
    */
   function acceptProtocol(peer: Peer, peerProtocol: unknown): boolean {
     const verdict = negotiateProtocol(peerProtocol)
-    // `verdict.missing`（V1 老端点没报版本）**不额外记账**：`peer.protocol === undefined`
-    // 本身就是那个事实，`/healthz` 的 `peersNoProtocol` 直接数它。曾经另有一个
-    // `peer.protocolMissing` 字段专门存它，但它**从来没有被读过**——同一件事的两份
-    // 记账迟早会分叉，而这一份连分叉都不会有人发现。
     if (verdict.ok) return true
     // 显式带 message：此刻 `peer.role` 还没设（hello 走这条闸时），所以
     // `CLIENT_ERROR_TEXT` 那张**客户端**表在这里取不到 —— 依赖它就会发出一个空 message，
@@ -1098,8 +1021,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
       pairBudgetWarnedAt: 0,
       backpressure: new BackpressureGate(),
       alive: true,
-      // 观测面计数的闩锁（见 Peer.countedProtocol）：连接为单位，不是 hello 为单位。
-      countedProtocol: false,
       // 轮转序号取模分配：**均匀是刻意的**。哪怕重启风暴里 10k 条连接在几十秒内
       // 全建起来，它们也会摊到所有桶上；若改成"分给下一个将要轮到的桶"，
       // 风暴会把它们全塞进同一两个桶，等于把刚拆掉的突发又造回来（C7 的场景）。
@@ -1211,14 +1132,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
     })
     ws.on('close', () => {
       peers.delete(ws)
-      // 协议版本观测面同步减一（见 peerProtocols 的注释：为什么是计数而不是 Set）。
-      // 顺序要紧：先减、后判是否归零删键 —— 反过来会漏掉"最后一个对端断开"这个状态。
-      if (peer.protocol === undefined) peersWithoutProtocol = Math.max(0, peersWithoutProtocol - 1)
-      else {
-        const left = (peerProtocols.get(peer.protocol) ?? 1) - 1
-        if (left > 0) peerProtocols.set(peer.protocol, left)
-        else peerProtocols.delete(peer.protocol)
-      }
       // 必须从桶里摘掉：Set 不摘就永远留着这条 Peer，ping 会继续朝一个已关闭的
       // socket 发（terminate 过的 ws 再 ping 是抛错被吞掉的），而且 maxConnections
       // 是按 wss.clients 算的，桶这边就会和闸门慢慢对不上。
@@ -1395,16 +1308,9 @@ export function createRelay(config: RelayConfig): RelayHandle {
       stateWriteFailures: persistence.failures,
       lastPingAgo: lastPingAt === 0 ? -1 : Math.round((Date.now() - lastPingAt) / 1000),
       shuttingDown,
-      // 协议版本协商的观测面（2026-10-07）。有了版本闸之后，"为什么这个对端连不上"
-      // 就成了新的排障问题，而没有这一项时它只能去翻日志。
-      //
-      // 报的是**对端报的最小/最大版本**与"没报过版本"的连接数，两个方向缺一不可：
-      // 只报最大值的话，一个全是老小程序的环境看起来与新版本一样正常。
+      // 本端说的协议版本（单版本制：它是一个常量，但排障时要能一眼看到"这一个中继
+      // 说的是哪一版"——版本对不上的现场表现是"连上了、什么都不发生"，没有任何一层会报错）。
       protocolSelf: PROTOCOL_VERSION,
-      protocolMin: MIN_SUPPORTED_PROTOCOL,
-      peerProtocolMin: peerProtocols.size === 0 ? -1 : Math.min(...peerProtocols.keys()),
-      peerProtocolMax: peerProtocols.size === 0 ? -1 : Math.max(...peerProtocols.keys()),
-      peersNoProtocol: peersWithoutProtocol,
     }
   }
 
@@ -1425,11 +1331,21 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 2. 整段 try/catch：真出现别的畸形（例如 absolute-form 里带坏 host 的 req.url）
    *    也只回 500，进程继续服务。
    */
+  /** 体超限的哨兵：调用方据此回 413（`instanceof` 判不出跨模块的同类错误，用 `code`）。 */
+  const BODY_TOO_LARGE = 'body_too_large'
+
   /**
    * 读一个**有上限**的请求体。
    *
    * 上限不是可选项：这是**无认证**接口，不限的话一个陌生人一次 POST 就能把内存喂满。
-   * 超限立刻回 413 并 `destroy()`（不断开的话对方可以一直往里灌）。
+   * 超限 ⇒ 抛 `{code: BODY_TOO_LARGE}` 交给调用方回 413，并且**立刻 `pause()`**
+   * （不再读、也不再往数组里堆）。
+   *
+   * ⚠️ 这里**刻意不 `destroy()`**（2026-10-11 修）：原来那一版在 `data` 回调里
+   * 先 `reject` 再同步 `destroy()`，于是调用方拿到拒绝去写 413/500 时 socket 已经没了
+   * ——实测客户端看到的是 `fetch failed / UND_ERR_SOCKET`（连接被重置），
+   * **一个状态码都收不到**，而注释里写着"超限立刻回 413"。少读一个体不是错，
+   * 让对方看不见为什么被拒才是错。半读的连接交给 `Connection: close` 收场。
    * 空体是合法的（3.1.2 的插件就不带体），返回 `''`。
    */
   function readBody(req: IncomingMessage, limit: number): Promise<string> {
@@ -1439,8 +1355,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
       req.on('data', (chunk: Buffer) => {
         size += chunk.length
         if (size > limit) {
-          reject(new Error('body_too_large'))
-          req.destroy()
+          req.pause()
+          reject(Object.assign(new Error(BODY_TOO_LARGE), { code: BODY_TOO_LARGE }))
           return
         }
         chunks.push(chunk)
@@ -1456,20 +1372,29 @@ export function createRelay(config: RelayConfig): RelayHandle {
   /**
    * `POST /api/claim-token` —— 领一枚 host token。
    *
-   * ## 带 `hostId` 与不带，是**两条不同的语义**（2026-10-11 起）
+   * ## **必须**带 `hostId`（2026-10-11 晚，用户裁决不做老客户端兼容）
    *
-   * - **带** `{hostId}`：给这一台机器签一枚，**只顶掉它自己旧的那一枚**
-   *   （`state.issueHostToken`）。这就是"后面的顶掉前面的"——而别的主机那枚不受影响。
-   * - **不带**（3.1.2 及更早的插件）：落到**未绑定槽位**，语义与旧版逐字一致
-   *   （认领即作废上一枚）。老客户端因此不会因为这次改动被打断，而它顶掉的也只是
-   *   同一个槽位里的那枚——按 hostId 签发的令牌不受影响。
+   * 带 `{hostId}`：给这一台机器签一枚，**只顶掉它自己旧的那一枚**
+   * （`state.issueHostToken`）。这就是"后面的顶掉前面的"——别的主机那枚不受影响。
    *
-   * ## 三道闸（沿用旧版，一道都没减）
+   * 不带 hostId（或体不是 JSON）⇒ **400 `host_id_required`**。中间那版把它签进
+   * "未绑定槽位"，而那枚令牌**对任意 hostId 都算数** ⇒ 任何人领一枚就能冒充任何主机
+   * 把真主机顶掉。这条接口是**无认证**的，那把万能钥匙必须拿掉；
+   * 老插件从此领不到令牌，这是裁决里接受的代价。
    *
-   * 只收 POST / 停机中不受理 / 同 IP 限频 4 秒。**任何人都能领一枚**这条没变：
+   * ## 闸门（旧版四道，一道都没减；3.1.3 又加了一道）
+   *
+   * ① 只收 POST；② 停机中不受理；③ 同 IP 限频 4 秒（`DRC_CLAIM_MIN_INTERVAL_MS`）；
+   * ④ 限频表有界（`CLAIM_TRACK_MAX`）；⑤ **令牌表有界**（`DRC_MAX_HOST_TOKENS`，3.1.3 加）。
+   * ⚠️ 这段注释曾写成"三道闸"：把 ④ 数漏了，而它正是"限频表不能变成无界字典"那一条。
+   * 数的口径以这一行枚举为准，别在别处再写一个数字（`deploy/README.md` 与 `README.md`
+   * 的表格各写了一种数法，那两处是历史口径）。
+   * 「认领即作废上一枚」那道**不再存在**：它被"按 hostId 一机一枚"取代了（见上）。
+   * **任何人都能领一枚**这条没变：
    * 这台中继会替陌生人中继流量（读不到内容，载荷密封），总量控制在运维侧。
    * 但**"随便 POST 一次就把合法主机永久踢下线"这条没有了**：认领动不了 env 那枚，
-   * 也动不了别人的 hostId 那枚。
+   * 也动不了别人的 hostId 那枚；而被顶掉的那台**会自愈**（3.1.4 起，插件侧收到
+   * `bad_token` 就带自己的 hostId 重新认领 —— 见 `packages/plugin/src/index.ts`）。
    */
   async function handleClaimToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') {
@@ -1500,7 +1425,26 @@ export function createRelay(config: RelayConfig): RelayHandle {
     rememberClaim(ip, now)
 
     let body: Record<string, unknown> = {}
-    const raw = await readBody(req, CLAIM_BODY_MAX_BYTES)
+    let raw: string
+    try {
+      raw = await readBody(req, CLAIM_BODY_MAX_BYTES)
+    } catch (error) {
+      /**
+       * 体超限 ⇒ **413 + 关连接**。
+       *
+       * 为什么不能让它冒到外面那层 catch（那里回 500）：这不是"服务端出错"，
+       * 而是"你发的东西太大"，两者在排错时是相反的结论。而 `Connection: close`
+       * 是因为体还没读完（`readBody` 只 `pause()` 了），复用这条连接会有半个体
+       * 留在缓冲区里污染下一次请求。
+       */
+      if ((error as { code?: unknown } | null)?.code === BODY_TOO_LARGE) {
+        res.statusCode = 413
+        res.setHeader('connection', 'close')
+        res.end(JSON.stringify({ error: 'body_too_large', limitBytes: CLAIM_BODY_MAX_BYTES }))
+        return
+      }
+      throw error
+    }
     if (raw.trim() !== '') {
       try {
         const parsed: unknown = JSON.parse(raw)
@@ -1508,12 +1452,30 @@ export function createRelay(config: RelayConfig): RelayHandle {
           body = parsed as Record<string, unknown>
         }
       } catch {
-        // 体不是 JSON：按"没带 hostId"处理（老客户端可能带着别的东西）。
-        // 不报 400 —— 一条宽松的兼容路径比一个 400 更能保住老装机。
+        // 体不是 JSON ⇒ 下面按"没带 hostId"报 400。**不再有宽松的兼容路径**：
+        // 那条路会把令牌签进"未绑定槽位"，而它是一把能冒充任何主机的万能钥匙。
       }
     }
     const rawHostId = typeof body.hostId === 'string' ? body.hostId.trim() : ''
-    if (rawHostId !== '' && (rawHostId.length > MAX_HOST_ID_LEN || !HOST_ID_RE.test(rawHostId))) {
+    if (rawHostId === '') {
+      /**
+       * **认领必须带 hostId**（2026-10-11 晚，用户裁决不做老客户端兼容）。
+       *
+       * 不带 hostId 的认领原来落到"未绑定槽位"，而那枚令牌**对任意 hostId 都算数**
+       * —— 等于任何人领一枚就能冒充任何主机（把真主机顶掉）。这条接口是**无认证**的，
+       * 所以那把万能钥匙必须拿掉。老版本的插件（不带体）从此领不到令牌，
+       * 那正是裁决里接受的代价。
+       */
+      res.statusCode = 400
+      res.end(
+        JSON.stringify({
+          error: 'host_id_required',
+          hint: 'POST {"hostId":"<本机身份>"} —— 2026-10-11 起令牌按 hostId 一机一枚，没有身份就不签',
+        }),
+      )
+      return
+    }
+    if (rawHostId.length > MAX_HOST_ID_LEN || !HOST_ID_RE.test(rawHostId)) {
       res.statusCode = 400
       res.end(
         JSON.stringify({ error: 'bad_host_id', hint: `hostId 最多 ${MAX_HOST_ID_LEN} 字符，只允许字母数字与 ._:-` }),
@@ -1521,20 +1483,15 @@ export function createRelay(config: RelayConfig): RelayHandle {
       return
     }
 
-    const slot = rawHostId === '' ? UNBOUND_HOST_TOKEN_KEY : rawHostId
     const token = newHostToken()
-    state.issueHostToken(slot, token, now)
+    state.issueHostToken(rawHostId, token, now)
     // 令牌表有界：超出就按"最近用过"从旧到新丢（先丢没人用的占位条目）。
     const pruned = state.pruneHostTokens(config.maxHostTokens)
     if (pruned > 0) log.warn('host tokens pruned', { dropped: pruned, kept: state.hostTokens.size })
     // 结构性变更 ⇒ 立刻落盘（与建/删会话同一条纪律）：不落盘的话中继一重启，
-    // 这些令牌就全没了，而主机侧"盘上有 token 就不再认领"⇒ 它们会被永久搁死。
+    // 这些令牌就全没了，而主机侧一旦有令牌就不再认领（要靠 3.1.4 起的那条自愈才回得来）。
     markStateChanged()
-    log.info(rawHostId === '' ? 'host token claimed (unbound)' : 'host token claimed', {
-      ip,
-      hostId: rawHostId,
-      hostTokens: state.hostTokens.size,
-    })
+    log.info('host token claimed', { ip, hostId: rawHostId, hostTokens: state.hostTokens.size })
     res.end(JSON.stringify({ token, hostId: rawHostId, rotatedAt: new Date(now).toISOString() }))
   }
 
@@ -1581,15 +1538,17 @@ export function createRelay(config: RelayConfig): RelayHandle {
        * UA 都是 `node`），而这条接口是**无认证**的 ⇒ 那个模型下
        * "任何能 POST 它的人都能把合法主机永久踢下线"。
        *
-       * 现在：带 `{hostId}` 认领只顶掉**这台机器自己**旧的那一枚；不带 hostId
-       * （3.1.2 及更早）落到未绑定槽位、语义不变；env 那枚**永不参与轮换**。
-       * 细节见 `handleClaimToken` 与 `state.ts` 的 `HostTokenEntry`。
+       * 现在：认领**必须**带 `{hostId}`（不带 ⇒ 400 `host_id_required`），
+       * 它只顶掉**这台机器自己**旧的那一枚；env 那枚**永不参与轮换**；
+       * 而被顶掉的那台**会自愈**（3.1.4 起，插件侧见到 `bad_token` 就带自己的
+       * hostId 重新认领并重连）。细节见 `handleClaimToken` 与 `state.ts` 的 `HostTokenEntry`。
        *
        * ## 滥用面（这条接口的真实成本，必须写明）
        *
        * 任何人都能领一枚 ⇒ 这台中继会**替陌生人中继流量**。他们读不到别人的内容
        * （载荷密封、中继零知识），但能消耗带宽与配对表容量。
-       * ⇒ 三道闸是给它加的，不是装饰：限频、停机中不受理、令牌表有界。
+       * ⇒ 闸门是给它加的，不是装饰：限频、停机中不受理、限频表有界、令牌表有界
+       *   （逐条枚举见 `handleClaimToken` 那段，这里不再写数字以免两处漂移）。
        */
       if (url.pathname === '/api/claim-token') {
         // 这条要读请求体（`{hostId}`），所以是异步的；异常一律在这里收干净，

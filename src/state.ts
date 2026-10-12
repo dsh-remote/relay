@@ -68,11 +68,13 @@ export interface PendingPair {
  * 现在按 `hostId` 一机一枚：认领只顶掉**这台机器自己**旧的那一枚
  * （用户原话："后面的顶掉前面的"），别人的那一枚不受影响。
  *
- * ## 未绑定槽位
+ * ## 没有"未绑定槽位"这回事了（2026-10-11 晚，用户裁决）
  *
- * `hostId === ''` 是**未绑定槽位**：3.1.2 及更早的插件认领时**不带 hostId**，
- * 落到这里，语义与旧版逐字一致（认领即作废上一枚）。它保证老客户端不被这次改动打断，
- * 同时把"互相顶掉"的影响**关在这个槽位里**——按 hostId 签发的那些令牌不受它影响。
+ * 中间那版还留着一个 `hostId === ''` 的**未绑定槽位**：不带 hostId 的认领落进去，
+ * 而它的令牌**对任意 hostId 都算数**（照抄 3.1.2 的语义）。那条兼容路径本身就是个洞：
+ * 谁领一枚未绑定令牌，谁就能拿它冒充**任何**主机连上来（把真主机顶掉），
+ * 于是"按 hostId 一机一枚"只挡住了不认得 hostId 的人。
+ * 用户裁决：**不需要兼容老客户端** ⇒ 认领必须带 hostId，没有未绑定槽位。
  */
 export interface HostTokenEntry {
   token: string
@@ -81,9 +83,6 @@ export interface HostTokenEntry {
   /** 最后一次**成功鉴权**的时刻；`0` = 签出来还没人用过（用于诊断"签了没人用"）。 */
   lastUsedAt: number
 }
-
-/** 未绑定槽位的键（见 `HostTokenEntry` 的注释）。 */
-export const UNBOUND_HOST_TOKEN_KEY = ''
 
 export interface Conversation {
   hostId: string
@@ -118,7 +117,7 @@ export class RelayState implements Clock {
   readonly clients = new Map<string, ClientEntry>()
   readonly pendingPairs = new Map<string, PendingPair>()
   readonly conversations = new Map<string, Conversation>()
-  /** 按 hostId 一机一枚（外加 `UNBOUND_HOST_TOKEN_KEY` 那个未绑定槽位）。 */
+  /** 按 hostId 一机一枚（键一定是非空 hostId，见 `HostTokenEntry`）。 */
   readonly hostTokens = new Map<string, HostTokenEntry>()
 
   /** 测试可注入固定时钟；默认用真实时间。 */
