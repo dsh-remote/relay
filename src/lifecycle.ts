@@ -69,8 +69,13 @@ export function createShutdown(
     const guard = setTimeout(() => {
       relay.log.warn('shutdown timed out, forcing exit')
       // 兜底路径也要补写一次盘：排空超时说明还有在途连接，但内存表仍是此刻最新的真相，
-      // 不写就等于把这次停机期间的变更丢掉。`shutdownForced` 同步进 /healthz——
-      // 这条 exit(0) 与"排空成功"同一个码，只有计数能让运维事后分辨。
+      // 不写就等于把这次停机期间的变更丢掉。
+      //
+      // ⚠️ 这条 exit(0) 与"排空成功"**同一个码**（刻意的：systemd/docker 两种情况都会
+      // 重启，而非零码会触发一堆"异常退出"告警）。而 `/healthz` 里的 `shutdownForced`
+      // 读不到事后了——**这条 warn 日志才是留给运维的事后证据**（下面还有一条同义的
+      // 落在 shutdown forced 上）。原注释说"只有计数能让运维事后分辨"是不实的：
+      // 进程已经退出，没人能再问它（2026-10-12 review 订正）。
       wasForced = true
       relay.forceShutdown()
       exit(0)

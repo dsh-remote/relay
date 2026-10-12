@@ -1733,7 +1733,15 @@ export function createRelay(config: RelayConfig): RelayHandle {
    *
    * 补写一次盘——这时内存表就是最新真相，不写等于把这次停机期间的全部变更丢掉。
    * 同时把 `shutdownForced` 记进 `/healthz`：兜底 exit(0) 与"排空成功"同码，
-   * 光看退出码分不出这两种停机，计数是运维唯一能事后分辨的出口。
+   * 光看退出码分不出这两种停机。
+   *
+   * ⚠️ 但要说清这个计数**能活多久**：`lifecycle.ts` 的兜底路径调完这里就 `exit(0)`，
+   * 而 `/healthz` 只有进程活着才答得上 ⇒ **进程退出后它读不到**。
+   * ⇒ 事后真正留得下来的是**代码里紧接着那条 `log.warn('shutdown forced' …)`**
+   * （journald / `docker logs`）。这个计数的真实读者是：① 判据（exit 被注入成记录器，
+   * 进程还活着）；② 有调用方接了停机出口却不真的退出进程的那种嵌入场景。
+   * 把它说成"运维事后唯一能分辨的出口"是**不实**的——那样会让人去 /healthz 找一个
+   * 已经不在了的进程（2026-10-12 review 订正）。
    */
   function forceShutdown(): void {
     counters.shutdownForced += 1
