@@ -110,13 +110,19 @@ test('Dockerfile 按 **单仓布局**拷文件（这条判据钉的是 2026-10-0
     /^COPY packages\//m,
     '`packages/` 前缀是**伞仓形态**的残留：单仓构建上下文里没有这个目录，构建会直接失败',
   )
-  assert.doesNotMatch(DOCKERFILE, /pnpm-workspace\.yaml/, '单仓没有 workspace：这一行是伞仓残留')
-  // 构建工作目录就是仓根（单仓：仓根 = 包根），`pnpm build` 直接产出 bundle
-  assert.match(
-    DOCKERFILE,
-    /WORKDIR \/src[\s\S]{0,900}?RUN pnpm build/,
-    '构建必须在仓根跑 pnpm build（它的 tsconfig 与 bundle 脚本都以仓根为基准）',
-  )
+  // ⚠️ `pnpm-workspace.yaml` 在单仓里**必须在场并拷进镜像**：它不是工作区定义，
+  // 是 pnpm 11 的设置位（allowBuilds / minimumReleaseAge 例外，由 split-repos 生成）。
+  // 缺了它 pnpm 11 默认不跑依赖安装脚本 ⇒ ERR_PNPM_IGNORED_BUILDS（2026-10-13 实测）。
+  assert.match(DOCKERFILE, /^COPY pnpm-workspace\.yaml \.\/$/m, 'pnpm-workspace.yaml 是 pnpm 11 的设置位，必须拷进镜像')
+  // 构建工作目录就是仓根（单仓：仓根 = 包根），`pnpm build` 直接产出 bundle。
+  // ⚠️ 用**行号比较**而不是 `[\s\S]{0,N}` 贪婪窗口：中间隔着成段的解释注释，
+  // 窗口大小会随注释长度变红（第一版 {0,200} 就这么红的——判据又骗了一次人）。
+  const lineIdx = (re) => DOCKERFILE.split('\n').findIndex((line) => re.test(line))
+  const workdirAt = lineIdx(/^WORKDIR \/src$/)
+  const buildAt = lineIdx(/^RUN pnpm build$/)
+  assert.ok(workdirAt >= 0, '找不到 WORKDIR /src')
+  assert.ok(buildAt >= 0, '找不到 RUN pnpm build')
+  assert.ok(workdirAt < buildAt, 'pnpm build 必须在 WORKDIR /src 之后（仓根 = 包根）')
   assert.doesNotMatch(DOCKERFILE, /pnpm --filter @dsh-remote\/protocol build/, 'workspace 的 --filter 构建是伞仓残留')
   // 产物拷贝路径要与仓根一致（改一处忘另一处 = 镜像里没有 /app/relay.mjs）
   assert.match(

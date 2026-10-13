@@ -64,6 +64,11 @@ WORKDIR /src
 # 要说明就写在上一行。
 COPY package.json ./
 COPY pnpm-lock.yaml ./
+# ⚠️ `pnpm-workspace.yaml` 在单仓里**必须拷**：它不是"工作区定义"，是 pnpm 11 的设置位
+# （`allowBuilds: esbuild` + 对自家刚发布包的 minimumReleaseAge 例外）。少了它，
+# pnpm 默认不执行依赖的安装脚本 ⇒ `ERR_PNPM_IGNORED_BUILDS`，构建当场失败
+# （2026-10-13 首次单仓部署实测）。该文件由 scripts/split-repos.mjs 生成。
+COPY pnpm-workspace.yaml ./
 #
 # `@dsh-remote/protocol` 是 devDependency、从 **npm** 装（不再是 workspace 软链）：
 # 单仓里没有它的源码，也不需要——它对 runtime 是零依赖（bundle 全内联）。
