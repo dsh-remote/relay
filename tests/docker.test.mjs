@@ -89,88 +89,70 @@ test('Dockerfile：STOPSIGNAL 与 ENTRYPOINT 的形状', () => {
   )
 })
 
-test('Dockerfile 按 **v3 单仓布局**拷文件（这条判据是为了钉住 2026-10-08 那个真实故障）', () => {
-  // v2 时这个仓独立，build 上下文就是本仓根 ⇒ `COPY package.json …` 拷的是"本包"。
-  // v3 变 monorepo 后，同一行拷的是 **monorepo 根**的 package.json —— 而根清单里
-  // 没有 relay 的依赖，于是 pnpm 报的错是「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」
-  // 这类**看起来毫不相关**的 mismatch（真实原因：那份清单不是这个包的）。
+test('Dockerfile 按 **单仓布局**拷文件（这条判据钉的是 2026-10-08 那个真实故障的**现行**形状）', () => {
+  // 这份 Dockerfile 的 COPY 形状**翻转过两次**，两边的教训都留着：
   //
-  // 症状：`docker compose build` 失败，而本机 `pnpm install` 完全正常。
-  // 所以这里逐条钉住"上下文是单仓根"这件事由 Dockerfile 自己保证。
-  assert.match(
-    DOCKERFILE,
-    /^COPY packages\/relay\/package\.json /m,
-    '必须显式拷 packages/relay/package.json：只拷根 package.json 会让 pnpm 拿错清单',
-  )
-  assert.match(
-    DOCKERFILE,
-    /^COPY packages\/protocol\/package\.json /m,
-    'protocol 的清单也要拷：relay 依赖它（哪怕走 npm 版本，workspace 里也得在场）',
-  )
-  assert.match(
-    DOCKERFILE,
-    /^COPY packages\/relay\/src \.\/packages\/relay\/src$/m,
-    '源码要拷进 packages/relay/ —— 它的 tsconfig 与 bundle 脚本都以包根为基准',
-  )
-  // 构建工作目录必须落在 relay 包里，否则 pnpm build 会在 monorepo 根跑
-  assert.match(
-    DOCKERFILE,
-    /WORKDIR \/src\/packages\/relay[\s\S]{0,200}?RUN pnpm build/,
-    '构建前必须 WORKDIR 到 packages/relay：在根目录跑 pnpm build 不会产出这个包的 bundle',
-  )
-  // 产物拷贝路径要与上面那处WORKDIR 一致（改一处忘另一处 = 镜像里没有 /app/relay.mjs）
-  assert.match(
-    DOCKERFILE,
-    /^COPY --from=build \/src\/packages\/relay\/dist\/bundle\/main\.js /m,
-    '产物路径要带 packages/relay/ 前缀：与 WORKDIR 一致，否则这一步在镜像构建末尾才失败',
-  )
-  // 反向：旧的单包写法不许残留（它是这次故障的根因）
+  // ① 2026-10-08（v3 刚拆仓）：服务器上摆的是伞仓树，而 Dockerfile 还是 v2 的单包写法
+  //    （`COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./`）⇒ 拷到的是 **monorepo 根**
+  //    的清单，pnpm 报「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」这种看起来毫不相关的
+  //    mismatch（真实原因：那份清单不是这个包的）。当时的修法是改成 `packages/` 前缀。
+  //
+  // ② 2026-10-13（3.1.5 起，用户裁决）：服务器改成**单仓部署**（部署源 = 本仓，不再摆伞仓）
+  //    ⇒ `packages/` 前缀反而成了错的：单仓的仓根**就是**包根，`COPY package.json ./`
+  //    拷的就是本包清单；`@dsh-remote/protocol` 是 devDependency、从 **npm** 装。
+  //
+  // ⇒ 现在钉的是**单仓**形状；`packages/` 前缀成了新的反向禁令（它是伞仓形态的残留，
+  //   在单仓构建里会因文件不存在而失败）。
+  assert.match(DOCKERFILE, /^COPY package\.json \.\/$/m, '仓根清单就是本包清单（单仓：仓根 = 包根）')
+  assert.match(DOCKERFILE, /^COPY pnpm-lock\.yaml \.\/$/m, '锁文件必须随仓（CI 的 --frozen-lockfile 也依赖它）')
   assert.doesNotMatch(
     DOCKERFILE,
-    /^COPY package\.json pnpm-lock\.yaml pnpm-workspace\.yaml \.\/$/m,
-    '单包时代的 COPY 写法不许残留：它在单仓里会拷到根清单而不是本包的',
+    /^COPY packages\//m,
+    '`packages/` 前缀是**伞仓形态**的残留：单仓构建上下文里没有这个目录，构建会直接失败',
   )
+  assert.doesNotMatch(DOCKERFILE, /pnpm-workspace\.yaml/, '单仓没有 workspace：这一行是伞仓残留')
+  // 构建工作目录就是仓根（单仓：仓根 = 包根），`pnpm build` 直接产出 bundle
+  assert.match(
+    DOCKERFILE,
+    /WORKDIR \/src[\s\S]{0,900}?RUN pnpm build/,
+    '构建必须在仓根跑 pnpm build（它的 tsconfig 与 bundle 脚本都以仓根为基准）',
+  )
+  assert.doesNotMatch(DOCKERFILE, /pnpm --filter @dsh-remote\/protocol build/, 'workspace 的 --filter 构建是伞仓残留')
+  // 产物拷贝路径要与仓根一致（改一处忘另一处 = 镜像里没有 /app/relay.mjs）
+  assert.match(
+    DOCKERFILE,
+    /^COPY --from=build \/src\/dist\/bundle\/main\.js /m,
+    '产物路径不带 packages/ 前缀：与仓根 WORKDIR 一致，否则这一步在镜像构建末尾才失败',
+  )
+  // 反向：`packages/` 前缀的产物路径不许残留
+  assert.doesNotMatch(DOCKERFILE, /COPY --from=build \/src\/packages\//, '伞仓形态的产物路径残留')
 })
 
-test('Dockerfile：COPY 只取镜像真正要的那几个文件，且 protocol 的源码在 install 之前', () => {
-  // ## 镜像只需要 protocol + relay 两个包
+test('Dockerfile：COPY 只取镜像真正要的那几个文件，install 与源码的顺序是单仓形状', () => {
+  // 单仓形态下 `@dsh-remote/protocol` 是 **devDependency、从 npm 装**：
+  // 镜像里不再需要 protocol 的清单与源码（伞仓形态才需要——它的 `prepare` 在 install
+  // 生命周期里跑 tsc，所以那时源码必须在 install **之前**进来；那条理由随协议进 npm 而消失）。
   //
-  // 我一度以为"pnpm-workspace.yaml 声明的包必须清单齐备"，为此加了 plugin/client/e2e
-  // 三条 COPY，并用一条判据把它固化。**那三条无效**：删掉之后
-  // `pnpm install --frozen-lockfile` 照样通过（2026-10-08 在生产服务器上实测：
-  // 只放 protocol + relay 两份清单，frozen 检查顺利过，只在下一步因缺 protocol 的
-  // tsconfig 而失败）。pnpm 只校验**它要解析的那些 importer**。
-  //
-  // 而那次「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」的 mismatch 真相不是"清单没拷全"，
-  // 而是**根 package.json 被覆盖**：上传源码时用 `tar xzf`，relay 的 package.json
-  // 覆盖到了仓库根 ⇒ pnpm 拿 relay 的依赖去比根的 lock ⇒ 报出 relay 的依赖名。
+  // 历史教训保留（2026-10-08）：那次「lockfile 有 ^22.9.0、manifest 要 ^26.6.3」的真相不是
+  // "清单没拷全"，而是**根 package.json 被覆盖**——上传源码时用 `tar xzf`，relay 的清单
+  // 盖到了仓库根 ⇒ pnpm 拿 relay 的依赖去比根的 lock。
   // **报错指错地方时，先怀疑"文件被覆盖"，别急着加 COPY。**
-  assert.match(DOCKERFILE, /^COPY packages\/relay\/package\.json /m, '必须拷 relay 的清单（它才是这个镜像的包）')
-  assert.match(DOCKERFILE, /^COPY packages\/protocol\/package\.json /m, 'protocol 是 relay 的依赖，清单必须在场')
   assert.doesNotMatch(
     DOCKERFILE,
-    /^COPY packages\/(plugin|client)\/package\.json /m,
-    '镜像不需要 plugin / client 的清单：加上无效（实测过），只会让构建上下文里出现用不到的东西',
+    /^COPY packages\/protocol\/(package\.json|tsconfig\.json|src)/m,
+    'protocol 的清单/源码是伞仓形态的残留（单仓从 npm 装 devDependency）',
   )
-
-  // protocol 的 `prepare` 是 install 生命周期的一环 ⇒ 它的源码必须在 install 之前
-  // ⚠️ 只认**行首是指令**的那一行：用 `indexOf` 会命中注释里提到的那句话
-  // （本文件注释里正好写了 "pnpm install 只软链它的 package.json"，位置还更靠后）。
+  // 镜像构建要用的三个路径：清单、锁、源码与脚本
+  for (const f of ['tsconfig.json', 'src', 'scripts']) {
+    assert.ok(DOCKERFILE.includes(`COPY ${f}`), `缺 ${f}：tsc/bundle 在构建阶段要用`)
+  }
+  // install 必须在源码 COPY **之前**：锁命中后改 src 不必重装依赖树（与伞仓相反的方向，
+  // 那边的顺序理由是 protocol 的 prepare，这里没有）。
   const lineOf = (re) => DOCKERFILE.split('\n').findIndex((line) => re.test(line))
   const installAt = lineOf(/^RUN\s+corepack enable && pnpm install/)
-  const protoSrcAt = lineOf(/^COPY packages\/protocol\/src/)
+  const srcAt = lineOf(/^COPY src \./)
   assert.ok(installAt >= 0, '找不到 pnpm install 那一步')
-  assert.ok(protoSrcAt >= 0 && protoSrcAt < installAt, 'protocol 的 src+tsconfig 必须在 install **之前** COPY')
-  assert.match(
-    DOCKERFILE,
-    /COPY packages\/protocol\/tsconfig\.json \.\/packages\/protocol\//,
-    'protocol 的 tsconfig 也要在 install 之前：它的 prepare 会 tsc，缺文件报 TS5058',
-  )
-
-  // 镜像构建要用的两个目录
-  for (const dir of ['packages/relay/src', 'packages/relay/scripts']) {
-    assert.ok(DOCKERFILE.includes(`COPY ${dir} `), `缺 ${dir}：bundle 脚本在构建阶段要用`)
-  }
+  assert.ok(srcAt >= 0 && srcAt > installAt, '源码应当在 install **之后** COPY（锁命中，改 src 不重装）')
 })
 
 test('COPY 行不许带行尾注释（Dockerfile 会把 # 之后的内容当成拷贝路径）', () => {

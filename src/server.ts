@@ -108,6 +108,8 @@ interface Peer {
   notedPairTableFull: boolean
   /** 同上：全局配对配额用尽那条 warn，每秒最多一行（0 = 还没记过）。 */
   pairBudgetWarnedAt: number
+  /** 同上：会话表满那条 warn（D6），每秒最多一行（0 = 还没记过）。 */
+  tableFullWarnedAt: number
   alive: boolean
   /**
    * 这条连接属于哪个 ping 桶（见 sweepPingBucket）。建连时按轮转序号取模分配，
@@ -141,6 +143,14 @@ function tokenMatches(expected: string, got: string): boolean {
 const CLAIM_TRACK_MAX = 10_000
 
 /**
+ * 结构性变更的落盘合并窗口（D6）。见 `markStateChanged` 的注释。
+ *
+ * 200 ms 的取舍：写盘从"每秒最多 20 次"压到"每秒 5 次"（全局配对配额的量级），
+ * 而崩溃时最多丢 200 ms 的变更。停机路径不等这个窗口。
+ */
+const PERSIST_COALESCE_MS = 200
+
+/**
  * 认领时 `hostId` 的形状与上限。
  *
  * 为什么要在门口卡：`hostId` 会变成令牌表的**键**，也会被写进状态文件；
@@ -153,7 +163,11 @@ const HOST_ID_RE = /^[A-Za-z0-9._:-]+$/
 
 export function createRelay(config: RelayConfig): RelayHandle {
   const log = new Log(config.logLevel)
-  const state = new RelayState({ maxPendingPairs: config.maxPendingPairs })
+  const state = new RelayState({
+    maxPendingPairs: config.maxPendingPairs,
+    // D6：会话表上界（缺了它，每次认领的同步整表写就成了无界的成本放大）。
+    maxConversations: config.maxConversations,
+  })
   const startedAt = Date.now()
   const pairBudget = new Budget(config.pairGlobalBudgetPerSec)
   /** `/api/pair-status` 的独立配额：它走 HTTP、无认证，和配对帧不是同一条入口。 */
@@ -164,6 +178,21 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const lastClaimAt = new Map<string, number>()
   let sweepTimer: NodeJS.Timeout | undefined
   let pingTimer: NodeJS.Timeout | undefined
+  /**
+   * 结构性变更的**待写标记**与合并窗口定时器（D6 的第二条，2026-10-13）。
+   *
+   * 为什么要有：`markStateChanged()` 原来每次都**同步**写整张会话表，而它的调用点里
+   * 包含"每次成功认领"——那张表当时没有上界，于是单次写盘的成本随表线性增长
+   * （实测 5 000 条 8.5 ms、5 万条 45 ms、20 万条 159 ms）。配对本身被全局配额
+   * 20/s 限着，可 5 万条时仍是 20 × 45 ms = 900 ms/秒 = **90% 的事件循环**。
+   *
+   * 窗口取 200 ms：结构性变更仍然在"下一次事件循环的空隙"里落盘（高��路径上把写盘
+   * 从每秒 20 次压到 5 次 ⇒ 同样 5 万条时降到约 4%），代价是**崩溃最多丢 200 ms 的变更**。
+   * 停机路径不等这个窗口：`close()` / `forceShutdown()` 直接 `persistNow()`，
+   * 而 `persistNow()` 自己会清掉待写标记与定时器 ⇒ 不会重复写、也不会漏写。
+   */
+  let persistPending = false
+  let persistTimer: NodeJS.Timeout | undefined
   let lastPingAt = 0
   /** 上一次把计数器抄进日志的时刻（0 = 还没抄过，所以启动后第一轮就抄）。 */
   let lastCountersAt = 0
@@ -262,6 +291,16 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   /** 真正写一次盘。返回是否成功——失败只计数，不抛（见 writeStateFile 的注释）。 */
   function persistNow(): boolean {
+    /**
+     * 直接写盘的那几条路（启动、停机、`flushPendingPersist`）都收口到这里，
+     * 所以"待写"状态必须在这里清掉——否则停机已经写完了，那个 200 ms 的定时器
+     * 还会再写一次（多一次全表写），而 `close()` 里"排空后再写一次"的语义也会被稀释。
+     */
+    persistPending = false
+    if (persistTimer !== undefined) {
+      clearTimeout(persistTimer)
+      persistTimer = undefined
+    }
     if (!persistence.enabled) return false
     const ok = writeStateFile(config.stateFile, snapshotState(state, Date.now()), log)
     if (ok) {
@@ -304,17 +343,49 @@ export function createRelay(config: RelayConfig): RelayHandle {
    */
 
   /**
-   * 会话表发生**结构性**变化后立刻落盘（建/删会话、成员表变动）。
+   * 会话表发生**结构性**变化后**请求**一次落盘（建/删会话、成员表变动、令牌签发）。
    *
-   * 为什么只盯结构性变化、不盯每一帧：`lastActivityAt` 每转发一帧就更新，
-   * 跟着它写就是每帧一次 fsync——那不是持久化，那是自造 DoS。
-   * 它的保鲜交给周期性补写（见 sweep 里的 `maybePersistPeriodic`）。
+   * ## 为什么是"请求"而不是"立刻写"（D6，2026-10-13）
    *
-   * 为什么删除路径必须走它（纪律第 3 条）：只在"建"的时候写，删掉的会话会永远留在盘上，
-   * 重启时又被读回来——**已经作废的会话被复活**，而主机那边的 `resync` 还要再花一轮
-   * 才把它清掉。这正是验收第 5 条盯的那个失败模式。
+   * 它原来每次都同步写整张表。2026-10-07 那轮只把 `resync` 那条路改成按语义分（结构性写、
+   * 只刷 `lastActivityAt` 的交给周期补写），**配对那条路留着立刻写**，理由写在当时那段
+   * 注释里：「一次落盘换一次扫码，这个代价比什么都划算」，而它的前提是
+   * 「配对表的规模有界（拓扑恒 1:1，会话数 ≈ 配对过的客户端数）」。
+   *
+   * ⚠️ **那个前提在 2026-10-13 被证伪**：`clientId` 由客户端自选，只有**并发**连接数有界，
+   * 时间维度上没有上界；认领接口又是无认证的（谁都能领一枚令牌）⇒ 一台主机按全局配额
+   * 20 次/秒 churn 配对，约 42 分钟堆到 5 万条，此后单次写 45 ms × 20 = 90% 事件循环
+   * ⇒ 心跳判定停摆、所有对端被一起踢掉。
+   *
+   * ⇒ 现在两条一起上：① 会话表有上界（`RelayConfig.maxConversations`，满了先回收已空的）；
+   *   ② 这一条改成 200 ms 合并窗口（写盘从每秒 20 次压到 5 次，同样 5 万条时约 4%）。
+   * 代价写清了：**崩溃最多丢 200 ms 的变更**（用户在手机上重新扫一次码），
+   * 停机路径不等这个窗口（`close()` / `forceShutdown()` 直接 `persistNow()`）。
+   *
+   * ## 为什么删除路径仍然必须走它（纪律第 3 条，没有被合并窗口削弱）
+   *
+   * 只在"建"的时候写，删掉的会话会永远留在盘上，重启时又被读回来——**已作废的会话被复活**，
+   * 而主机那边的 `resync` 还要再花一轮才清掉。合并窗口只推迟 200 ms，不取消这一次写。
+   *
+   * 为什么只盯结构性变化、不盯每一帧：`lastActivityAt` 每转发一帧就更新，跟着它写就是
+   * 每帧一次 fsync——那不是持久化，那是自造 DoS。保鲜交给 `maybePersistPeriodic`。
    */
   function markStateChanged(): void {
+    if (!persistence.enabled) return
+    persistPending = true
+    if (persistTimer !== undefined) return
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined
+      flushPendingPersist()
+    }, PERSIST_COALESCE_MS)
+    // unref 与"停机集中撤销"成对：它不该拖住进程退出，而 close() 里 persistNow()
+    // 会把它清掉（见上面 persistNow 的注释）。
+    persistTimer.unref?.()
+  }
+
+  /** 把待写的变更立刻落盘（合并窗口到期、或停机路径已经写过之后不需要调）。 */
+  function flushPendingPersist(): void {
+    if (!persistPending) return
     persistNow()
   }
 
@@ -675,9 +746,37 @@ export function createRelay(config: RelayConfig): RelayHandle {
     }
     const claimed = state.claim(frame.pairingToken, peer.clientId)
     if (!claimed.ok) {
+      /**
+       * ⚠️ **内部原因不许原样出网**（D6）。`pair-fail` 的 reason 是**冻结消费面**
+       * （协议 `pairFail()` 的类型 + 小程序 `translatePairFail` 都只认那四个）⇒
+       * 新的内部原因 `table_full` 必须在这里映射掉，否则 TypeScript 就会挡住它——
+       * 这正是我们要的强制点：映射必须是**显式**的一次判断，而不是"以后再说"。
+       *
+       * 映射到 `invalid_or_expired` 是有意的"善意的谎"：那四个里只有它对用户成立
+       * （"这张码现在配不上"）。真正的table_full 进日志，也进 `/healthz` 的计数。
+       *
+       * ⚠️ 而它**不计入** `peer.pairAttempts`：那是"这张码不对"（用户或输入的问题），
+       * 计满 5 次会把这台手机踢下线（4008）。表满是**服务端**状态，踢对端既解决不了
+       * 问题、又惩罚了恰好在这时配对的合法用户。速率由全局配对配额（20/s）管着。
+       */
+      const wireReason = claimed.reason === 'table_full' ? 'invalid_or_expired' : claimed.reason
+      if (claimed.reason === 'table_full') {
+        counters.rejectedPairs += 1
+        const now = Date.now()
+        if (now - peer.tableFullWarnedAt >= 1000) {
+          peer.tableFullWarnedAt = now
+          log.warn('conversation table full, refusing new pairings (D6)', {
+            clientId: peer.clientId,
+            conversations: state.conversations.size,
+            max: config.maxConversations,
+          })
+        }
+        sendToPeer(peer, pairFailFrameOf(wireReason, frame.pairingToken))
+        return
+      }
       peer.pairAttempts += 1
       counters.rejectedPairs += 1
-      sendToPeer(peer, pairFailFrameOf(claimed.reason, frame.pairingToken))
+      sendToPeer(peer, pairFailFrameOf(wireReason, frame.pairingToken))
       log.info('pair failed', {
         clientId: peer.clientId,
         reason: claimed.reason,
@@ -1019,6 +1118,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       notedNonMember: false,
       notedPairTableFull: false,
       pairBudgetWarnedAt: 0,
+      tableFullWarnedAt: 0,
       backpressure: new BackpressureGate(),
       alive: true,
       // 轮转序号取模分配：**均匀是刻意的**。哪怕重启风暴里 10k 条连接在几十秒内

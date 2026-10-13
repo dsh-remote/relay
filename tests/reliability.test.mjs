@@ -323,7 +323,24 @@ test('C5b：Budget 首用就开窗口（换单调时钟后，开机第一秒不�
   rolled.take(10_000)
   rolled.take(10_000)
   assert.equal(rolled.take(9_940), true, '时钟回拨那条不能被这次改动吞掉')
-  // 反向自检用的形状：把首用那支删掉，上面第一条会红
+  // 反向自检：把"首用开窗口"那一支删掉，上面第一条会红 —— 用旧逻辑的样本证明这一点，
+  // 而不是只在注释里声称（本项目纪律：判据的反证要真跑，不停在嘴上）。
+  const legacyTake = (state, now, perWindow, windowMs) => {
+    if (now - state.windowAt >= windowMs || now < state.windowAt) {
+      state.windowAt = now
+      state.left = perWindow
+    }
+    if (state.left <= 0) return false
+    state.left -= 1
+    return true
+  }
+  const legacy = { windowAt: 0, left: 0 }
+  assert.equal(
+    legacyTake(legacy, 500, 1, 1000),
+    false,
+    '夹具自检：旧逻辑在开机第一秒内必须全拒（否则上面那条首用判据是恒绿的）',
+  )
+  assert.equal(budget.take(2_500), true, '窗口继续照常轮换（样本不能把真实现带坏）')
 })
 
 // ── D 组：配对状态机的「文档说的 ≠ 做的」 ───────────────────────────────

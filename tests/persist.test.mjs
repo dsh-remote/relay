@@ -177,10 +177,29 @@ test('验收 1：配对后重启中继，会话表不是空的', async () => {
     const first = await startRelay({ DRC_STATE_FILE: stateFile })
     const { conversationId } = await pairUp(first)
     assert.equal(first.relay.health().conversations, 1)
-    // 配对那一刻就该落盘——不等清扫、不等周期补写。
+    /**
+     * ⚠️ **这条判据的契约在 2026-10-13 改过（D6，用户裁决按方案③）**。
+     *
+     * 原来它断言的是「配对那一刻盘上就有」——那是 2026-10-07「一次落盘换一次扫码」
+     * 那条裁决的强形式，它的前提「配对表规模有界」在 2026-10-13 被证伪
+     * （`clientId` 由客户端自选、时间维度无上界 ⇒ 一台主机 20/s churn 就能把表堆到
+     * 5 万条，此后每次配对同步写整表要 45 ms × 20 = 90% 事件循环）。
+     *
+     * ⇒ 结构性变更改成 200 ms 合并窗口（写盘从每秒 20 次压到 5 次）。
+     * **真正要保住的保证没有变**，本条现在逐项写清：
+     * ① 窗口到期它自己会写（不需要任何停机动作）；
+     * ② **正常停机（SIGTERM → close）后立刻在盘上**；
+     * ③ 重启读得回来。
+     * 丢的只有一条：**崩溃/掉电**在窗口内（最多 200 ms）丢掉的变更——用户重新扫一次码。
+     */
+    const deadline = Date.now() + 2000
+    while (Date.now() < deadline) {
+      if (JSON.parse(readFileSync(stateFile, 'utf8')).conversations.length === 1) break
+      await new Promise((r) => setTimeout(r, 20))
+    }
     const onDisk = JSON.parse(readFileSync(stateFile, 'utf8'))
     assert.equal(onDisk.version, STATE_FILE_VERSION)
-    assert.equal(onDisk.conversations.length, 1)
+    assert.equal(onDisk.conversations.length, 1, '合并窗口到期后它必须自己写盘（不需要停机）')
     assert.equal(onDisk.conversations[0].conversationId, conversationId)
     await stopRelay(first)
 
@@ -477,9 +496,23 @@ test('验收 5b：空会话回收同样同步删盘（走清扫那条路）', as
     // 一个合法触发——主机离开），所以这里等的是 host，不是 client。
     client.send({ t: 'session-leave', sessionId: conversationId })
     await host.until((f) => f.t === 'peer-left')
-    // 清扫跑掉之后盘上也要清干净。
+    // ⚠️ **同步点必须选"被测行为"，不是"文件里恰好长什么样"**（2026-10-13 D6 时暴露）。
+    //
+    // 原来这里是 `while (盘上 conversations.length !== 0)`：旧契约下"配对立刻落盘"让文件
+    // 里先有 1 条，于是这个轮询**恰好**在等删除落盘，是一个真实的同步点。
+    // 改成 200 ms 合并窗口之后，配对那次写还在窗口里 ⇒ 文件仍是启动那份"0 条" ⇒
+    // 轮询**立刻**满足 ⇒ 断言在清扫还没跑时就往下走（实测 mem=1 / disk=0 / writes=1），
+    // 随后 `close()` 把内存里那条 1 写回盘上 ⇒ 重启后"已回收的会话被复活"。
+    //
+    // ⇒ 改成等**内存**回收真的发生（那才是这条判据要验的行为），再断言盘上跟上。
     const deadline = Date.now() + 2000
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && first.relay.health().conversations !== 0) {
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    assert.equal(first.relay.health().conversations, 0, '空会话没有被回收（清扫那一路坏了 —— 那与落盘无关）')
+    // 内存回收之后，盘上必须跟上（合并窗口 ≤200 ms，不需要停机动作）。
+    const diskDeadline = Date.now() + 2000
+    while (Date.now() < diskDeadline) {
       if (JSON.parse(readFileSync(stateFile, 'utf8')).conversations.length === 0) break
       await new Promise((r) => setTimeout(r, 20))
     }
@@ -487,7 +520,10 @@ test('验收 5b：空会话回收同样同步删盘（走清扫那条路）', as
     await stopRelay(first)
     const second = await startRelay({ DRC_STATE_FILE: stateFile })
     try {
-      assert.equal(second.relay.health().conversations, 0)
+      // 纪律第 3 条的**真正**保证：已回收的会话重启后不许复活。
+      // （契约在 2026-10-13 改过：删除也走 200 ms 合并窗口，不再"当场同步删盘"——
+      //  但停机路径强制落盘，所以正常停机后盘上一定是删干净的那一份。）
+      assert.equal(second.relay.health().conversations, 0, '已回收的会话被复活了 —— 那正是纪律第 3 条要挡的')
     } finally {
       await stopRelay(second)
     }

@@ -106,7 +106,23 @@ export interface Conversation {
 export type ClaimResult =
   { ok: true; conversationId: string; hostId: string; detached: string[] } | { ok: false; reason: PairRejectReason }
 
-export type PairRejectReason = 'invalid_or_expired' | 'already_used' | 'host_offline'
+/**
+ * 认领被拒的**内部**原因。
+ *
+ * ⚠️ 前面三个是**线上帧的冻结消费面**（协议 `pairFail()` 的参数类型就是这四个 + `bad_token`，
+ * 小程序 `translatePairFail` 也只认它们）⇒ 它们可以原样出网。
+ *
+ * `table_full` 是 **2026-10-13（D6）新增的内部原因**：会话表满了。它**绝不能**原样写进
+ * `pair-fail` —— TypeScript 的参数类型会挡住，而那正是我们要的强制点：
+ * 映射必须显式写在 `server.ts` 的调用点上（内部原因进日志与 `/healthz` 的计数，
+ * 线上给手机的是冻结面里最接近的那一个）。
+ */
+export type PairRejectReason =
+  | 'invalid_or_expired'
+  | 'already_used'
+  | 'host_offline'
+  /** 会话表已达上界且回收不出位置（D6）。**内部原因，不进线上帧。** */
+  | 'table_full'
 
 export interface Clock {
   now(): number
@@ -123,10 +139,16 @@ export class RelayState implements Clock {
   /** 测试可注入固定时钟；默认用真实时间。 */
   private readonly clock: () => number
   private readonly maxPendingPairsValue: number
+  /**
+   * 会话表上界（D6）。见 `RelayConfig.maxConversations` 的注释：这是"每次认领同步整表写"
+   * 那条成本链的**唯一**封口。
+   */
+  private readonly maxConversationsValue: number
 
-  constructor(options: { now?: () => number; maxPendingPairs?: number } = {}) {
+  constructor(options: { now?: () => number; maxPendingPairs?: number; maxConversations?: number } = {}) {
     this.clock = options.now ?? (() => Date.now())
     this.maxPendingPairsValue = options.maxPendingPairs ?? 1000
+    this.maxConversationsValue = options.maxConversations ?? 5000
   }
 
   now(): number {
@@ -208,6 +230,30 @@ export class RelayState implements Clock {
     return { ok: true, replaced: existing !== undefined, full: false }
   }
 
+  /**
+   * 回收**已空**的会话，从最旧的一条开始，直到表回到上界以下（D6）。
+   *
+   * "最旧"按 `emptySince ?? lastActivityAt` 算——即"它被放弃得有多久"，
+   * 而不是"会话建立得有多早"：一条建立了很久但直到刚才才被放弃的会话，
+   * 比一条刚建立就被放弃的更该回收。
+   *
+   * 返回回收了几条（调用方拿它写日志／计数——回收这件事必须留痕，
+   * 否则"表为什么突然小了一截"只能靠猜）。
+   */
+  evictAbandonedConversations(): number {
+    if (this.conversations.size < this.maxConversationsValue) return 0
+    const abandoned = [...this.conversations.entries()]
+      .filter(([, conv]) => conv.clients.size === 0)
+      .sort((a, b) => (a[1].emptySince ?? a[1].lastActivityAt) - (b[1].emptySince ?? b[1].lastActivityAt))
+    let dropped = 0
+    for (const [conversationId] of abandoned) {
+      if (this.conversations.size < this.maxConversationsValue) break
+      this.conversations.delete(conversationId)
+      dropped += 1
+    }
+    return dropped
+  }
+
   /** 还能被认领的码数（`/api/pair-status` 与主机侧「还有没有码可发」问的都是它）。 */
   countClaimablePairs(): number {
     let n = 0
@@ -224,6 +270,32 @@ export class RelayState implements Clock {
     if (pending.used) return { ok: false, reason: 'already_used' }
     const host = this.hosts.get(pending.hostId)
     if (!host || host.ws.readyState !== WS_OPEN) return { ok: false, reason: 'host_offline' }
+
+    /**
+     * 容量闸（D6）：**先回收"已空"的会话，仍满才拒**。
+     *
+     * ## 为什么放在 `pending.used = true` **之前**
+     *
+     * 放在之后的话，一次因为表满而失败的认领会**把那张码烧掉**（`used` 已经置真）⇒
+     * 用户在手机上看到的是「该配对码已被使用」，而真实原因是"中继忙"——那是把一次
+     * 服务端状态说成用户的错。放在前面 ⇒ 拒绝之后那张码还能用，用户过一会儿重试即可。
+     *
+     * ## 回收的只限"已空"的那些（`clients.size === 0`）
+     *
+     * 成员为空的会话已经是**被放弃**的：手机要么显式 `session-leave` 了，要么被重配挤走了
+     * （`claim` 里的 `leaveAll` / `leave` 会给旧会话打上 `emptySince`）。
+     * 它们平时由 `sweepEmpty` 在 `conversationEmptyTtlMs`（默认 30 分钟）后回收，
+     * 这里只是把那条计时**提前**——代价是"走了又回来"的那台手机要重新扫码，
+     * 而那条路本来也是它唯一的路（回不来：没有任何路径能把成员加回一条已空的会话）。
+     * ⚠️ 而 socket 断开**不算**已空（D3 免扫码：成员在断连时是留着的）⇒
+     * 正在切后台、几分钟内会回来的手机不受这条影响。
+     */
+    if (this.conversations.size >= this.maxConversationsValue) {
+      this.evictAbandonedConversations()
+      if (this.conversations.size >= this.maxConversationsValue) {
+        return { ok: false, reason: 'table_full' }
+      }
+    }
 
     pending.used = true
     // 同一台手机重配：先把它从旧会话里摘干净（复核 🟡7，理由见 leaveAll）。

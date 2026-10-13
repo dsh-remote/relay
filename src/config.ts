@@ -57,6 +57,32 @@ export interface RelayConfig {
    */
   maxHostTokens: number
   /**
+   * 会话表上限（2026-10-13，`DRC_MAX_CONVERSATIONS`）。
+   *
+   * ## 为什么必须有（这是 D6，那是它唯一缺的那一环）
+   *
+   * 中继其余每张表都有上界：配对码表 `maxPendingPairs`、令牌表 `maxHostTokens`、
+   * 认领限频表 `CLAIM_TRACK_MAX`、连接数 `maxConnections`。**只有会话表没有**，
+   * 而每次成功认领都要同步写一整张表 ⇒ 单次配对的成本随表线性增长。
+   * 实测（本机，预热后 20 次取均值）：100 / 1 000 / 5 000 条 = 6.05 / 7.15 / **8.50 ms**；
+   * 50 000 条 45 ms、200 000 条 159 ms（文件 25.6 MB）。
+   *
+   * 而 `clientId` 由客户端自选、只有**并发**连接数有界，时间维度上没有上界 ⇒
+   * 一台自领令牌的主机（认领接口无认证）按全局配额 20 次/秒 churn 配对，
+   * 约 42 分钟就能把表堆到 5 万条、单次写吃掉 90% 事件循环 ⇒ **中继整体停摆**，
+   * 心跳判定跟着停，所有对端一起被 `heartbeat timeout` 踢掉。
+   *
+   * ## 默认 5000 的依据
+   *
+   * 合法的部署规模是个位数（生产实测 `conversations: 1`），5000 留了三个数量级的余量；
+   * 而它把"每次配对的同步写"钉在 8.5 ms —— 20 次/秒也只有 17% 事件循环，
+   * 叠加 `server.ts` 那条 200 ms 合并写盘窗口后进一步降到约 4%。
+   *
+   * 满了的行为：先回收**已空**的会话（`clients.size === 0`，见 `RelayState.claim`），
+   * 仍满才拒新认领（内部原因 `table_full`，**不进线上帧**，见 `PairRejectReason`）。
+   */
+  maxConversations: number
+  /**
    * 同一 IP 两次认领的最短间隔（毫秒），默认 4000。
    *
    * 为什么它是配置而不是常量：判据要能**确定性地**验"第二枚顶掉第一枚"，
@@ -318,6 +344,9 @@ export function loadConfig(
     pairStatusBudgetPerSec: integer(env.DRC_PAIR_STATUS_PER_SEC, 5, 'DRC_PAIR_STATUS_PER_SEC', problems),
     maxPendingPairs: integer(env.DRC_MAX_PENDING_PAIRS, 1000, 'DRC_MAX_PENDING_PAIRS', problems),
     maxHostTokens: integer(env.DRC_MAX_HOST_TOKENS, 500, 'DRC_MAX_HOST_TOKENS', problems),
+    // D6：会话表是唯一曾经没有上界的一张表，而每次认领都要同步写它（成本 ∝ 表大小）。
+    // 默认与依据见 `RelayConfig.maxConversations` 的注释。
+    maxConversations: integer(env.DRC_MAX_CONVERSATIONS, 5_000, 'DRC_MAX_CONVERSATIONS', problems),
     claimMinIntervalMs: claimMinIntervalMs(env, problems),
     conversationIdleTtlMs: integer(env.DRC_CONV_IDLE_TTL_MS, 7 * 24 * 3600 * 1000, 'DRC_CONV_IDLE_TTL_MS', problems),
     // P2-⑤（2026-10-04 用户拍板 30 分钟）：远小于 7 天的空闲 TTL。
