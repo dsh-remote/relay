@@ -19,6 +19,8 @@
 export class Budget {
   private windowAt = 0
   private left = 0
+  /** 有没有真的开过窗口（见 `take` 的第 ② 条）。 */
+  private armed = false
 
   constructor(
     private readonly perWindow: number,
@@ -27,14 +29,22 @@ export class Budget {
 
   /** 取一个配额；成功 true，用尽 false。 */
   take(now: number): boolean {
-    // 那条 `now < this.windowAt` 是**时钟回拨**兜底（2026-10-07 审计）：`date -s` 回拨、
-    // VM 快照恢复、ntpd 从 slew 退化成 step 之后，`windowAt` 仍停在未来的那个值，
-    // 于是 `now - windowAt` 在接下来整整 T 秒里都是负数、永远达不到 windowMs，而 left
-    // 又已归零 —— 全局限流**冻死**：配对一路失败（手机上翻成「配对码无效或已过期」，
-    // 真实原因只在日志里），每条连接的帧闸同样冻死。一台机器 NTP 抖一下就够。
-    if (now - this.windowAt >= this.windowMs || now < this.windowAt) {
+    // ① `now < this.windowAt` 是**时钟回拨**兜底（2026-10-07 审计）：`date -s` 回拨、
+    //    VM 快照恢复、ntpd 从 slew 退化成 step 之后，`windowAt` 仍停在未来的那个值，
+    //    于是 `now - windowAt` 在接下来整整 T 秒里都是负数、永远达不到 windowMs，而 left
+    //    又已归零 —— 全局限流**冻死**：配对一路失败（手机上翻成「配对码无效或已过期」，
+    //    真实原因只在日志里），每条连接的帧闸同样冻死。一台机器 NTP 抖一下就够。
+    // ② `!armed` 是**首用**兜底（2026-10-13 补）。原来只有 `windowAt = 0, left = 0`：
+    //    生产上所有调用点传的是 `Date.now()`（epoch 毫秒，恒远大于窗口宽度），所以
+    //    `now - 0 >= windowMs` 恒成立、窗口当场重开 ⇒ 这条**今天不可见**。
+    //    但 `Budget` 是导出的，判据与将来的调用方可以注入任意时钟 —— 换成进程内单调
+    //    时钟（`process.hrtime` / `performance.now`）之后，**开机第一秒内 `now < 1000`，
+    //    两条判据都不成立 ⇒ left 停在 0、整整一秒内全拒**。而那种"看起来配错了"的故障
+    //    没有别的原因可查（日志里一条都没有）。⇒ 首用必须开一次窗口。
+    if (!this.armed || now - this.windowAt >= this.windowMs || now < this.windowAt) {
       this.windowAt = now
       this.left = this.perWindow
+      this.armed = true
     }
     if (this.left <= 0) return false
     this.left -= 1

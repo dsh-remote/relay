@@ -307,6 +307,25 @@ test('C5：时钟回拨不再把限流冻死', async () => {
   assert.equal(budget.take(9_940), true, '时钟回拨后配额应当恢复，而不是冻死')
 })
 
+test('C5b：Budget 首用就开窗口（换单调时钟后，开机第一秒不许全拒）', async () => {
+  // 2026-10-13 补。生产上 `now` 恒为 `Date.now()`（epoch 毫秒），所以"第一秒全拒"
+  // 今天不可见；但 `Budget` 是导出的，注入一个小时钟（`process.hrtime` /
+  // `performance.now` 这类进程内单调时钟）就会撞上：`windowAt=0, left=0` 而
+  // `now < 1000` ⇒ 窗口判据一条都不成立 ⇒ 整整一秒内什么都发不出去，
+  // 且日志里没有别的原因可查。判据就是要在改动前红。
+  const { Budget } = await import('../dist/src/limits.js')
+  const budget = new Budget(1, 1000)
+  assert.equal(budget.take(500), true, '进程启动 0.5s 时第一次取配额就该成功（首用要先开窗口）')
+  assert.equal(budget.take(600), false, '配额用尽后同窗口内仍然拒')
+  assert.equal(budget.take(1_500), true, '窗口到期后照常恢复')
+  // 与 C5（时钟回拨）不能互相破坏：回拨那条仍然要恢复
+  const rolled = new Budget(1, 1000)
+  rolled.take(10_000)
+  rolled.take(10_000)
+  assert.equal(rolled.take(9_940), true, '时钟回拨那条不能被这次改动吞掉')
+  // 反向自检用的形状：把首用那支删掉，上面第一条会红
+})
+
 // ── D 组：配对状态机的「文档说的 ≠ 做的」 ───────────────────────────────
 
 function stateHarness(now = () => 1_000_000) {
