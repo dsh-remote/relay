@@ -1,0 +1,60 @@
+{
+  "name": "@dsh-remote/relay",
+  "private": true,
+  "version": "0.5.0",
+  "description": "DSH Remote Control 的零知识 WebSocket 中继：只做路由，不碰载荷明文。可自托管的单文件产物。",
+  "type": "module",
+  "license": "MIT",
+  "author": "dsh-remote",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dsh-remote/relay.git"
+  },
+  "homepage": "https://github.com/dsh-remote/relay#readme",
+  "bugs": {
+    "url": "https://github.com/dsh-remote/relay/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "remote-control",
+    "relay",
+    "websocket",
+    "zero-knowledge",
+    "self-hosted"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/bundle/main.js",
+  "scripts": {
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs",
+    "start": "node dist/bundle/main.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node scripts/bundle-relay.mjs && node --test --test-timeout=60000 \"tests/*.test.mjs\"",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@dsh-remote/protocol": "^0.5.0",
+    "@types/node": "^26.6.3",
+    "@types/ws": "^8.5.12",
+    "esbuild": "^0.28.2",
+    "prettier": "^3.3.3",
+    "typescript": "^7.0.2",
+    "ws": "^8.18.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "bin": {
+    "dsh-remote-relay": "./dist/bundle/main.js"
+  },
+  "files": [
+    "dist/bundle",
+    "deploy",
+    "SECURITY.md"
+  ],
+  "//publishConfig": "2026-10-23 起 relay 不发 npm（用户裁决）：中继是自部署服务，分发形态是 Docker 镜像 + GitHub Release 上的自包含单文件。保留这一行注释是为了让『为什么没有 publishConfig』有据可查（免得下一个人以为它是漏配）。",
+  "//npmTrust": "npm 上的 24 个版本已于 2026-10-23 下架；本仓的 Trusted Publishing 信任也应撤销：npx -y npm@12.2.0 trust github @dsh-remote/relay --repo dsh-remote/relay --file release.yml --remove"
+}

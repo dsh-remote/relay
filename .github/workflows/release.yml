@@ -1,0 +1,142 @@
+name: Release
+
+# 打一个 `v*` 标签即发布：**完整校验 → 版本号对得上标签 → 建 GitHub Release（挂单文件产物）**。
+#
+# ## ⛔ 2026-10-23：relay **不再发 npm**（用户裁决）
+#
+# npm 只发 `@dsh-remote/protocol` 与 `@dsh-remote/plugin`（用户侧要装的东西）。
+# 中继是**自部署的服务**，不是用户装的库：
+#   · 它的分发形态是 **Docker 镜像**（`dsh-remote-relay:<version>`）与 **GitHub Release 上的
+#     自包含单文件**（`dist/bundle/main.js`，scp 一个文件 + systemd restart 就能跑）；
+#   · 这两条路上**没有一行代码依赖 npm 注册表** —— 生产部署用的是拆仓 tag 的源码，
+#     与本仓发不发 npm 无关（`deploy/README.md` 的重建流程照旧）；
+#   · 而 npm 上那份包**零依赖者**（没有任何包依赖 `@dsh-remote/relay`），留着只是
+#     "看着像在维护一个 npm 包"，实际只增加"以为它会被更新"的误解面。
+# ⇒ 本工作流改为：校验 → 建 Release → 挂产物。**不碰 npm**（连 provenance 也不用验了）。
+#
+# ## 前置条件：npm 侧要有指向**本仓、本文件**的 Trusted Publishing
+#
+#     npm trust github @dsh-remote/relay --repo dsh-remote/relay --file release.yml --allow-publish
+#
+# ⚠️ **`--file` 必须逐字等于本文件名。** npm 侧**不校验它存不存在** —— 2026-10-10 实测：
+# 拿一个根本不存在的文件名做 `--dry-run`，它照样打印"配好了"，一句警告都没有。
+# ⇒ 名字对不上时，那条信任关系会配得**看起来完全成功**，却永远等不到一次发布，
+# 而失败现场没有任何信号（不报错、不告警、CI 也不会红）。
+#
+# ## 下面每一步都对应一次真事故（不是防御性编程）。
+# ⚠️ 2026-10-23 起本仓**不再发 npm** ⇒ 第 1/2/3 条（token 清空 / 幂等 / provenance 验）
+#    **对本仓已不适用**，它们仍适用于**仍在发 npm 的 protocol 与 plugin 两仓**（那边的工作流
+#    原文照抄了这些教训）。这里保留记载，避免"换个仓踩一遍同一个坑"。
+#
+# 1. **`NODE_AUTH_TOKEN` 要显式清空**（见"发布到 npm"那步）：`actions/setup-node` 收到
+#    `registry-url` 之后会往 `.npmrc` 落一句 `_authToken=${NODE_AUTH_TOKEN}`，
+#    而 pnpm 在 OIDC 失败时会**静默回落成 token 发布** —— 版本发出去了、工作流是绿的、
+#    **attestation 一个没有**，日志里只有一行 `Skipped OIDC: … 404`。
+# 2. **发布要幂等**：版本号已在注册表就跳过，而不是让它 403 把后面的 GitHub Release 一起带走。
+# 3. **provenance 要独立验，且窗口给够**：工作流绿 ≠ 带 attestation（见第 1 条）；
+#    而窗口给小了会**假红**，把"版本号不可复用"变成一条死路。
+#
+# 产物形态：`dist/bundle/main.js` 是**自包含单文件**（ws / zod / 协议层全部内联），
+# 生产部署退化成「scp 一个文件 + systemctl restart」。它**挂到 Release 上**给部署用，
+# 而 npm 包里放的是打包好的同一个文件（`files` 白名单里的 `dist/bundle`）。
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  # `contents: write` 只为最后建 GitHub Release（不再需要 `id-token: write`：不发 npm 就不用 OIDC）。
+  # 这两个是本工作流**全部**的权限，别再加。
+  contents: write
+
+concurrency:
+  # 同一个标签不许并发跑两次：npm 版本号不可重用，撞上就是一次不可恢复的失败。
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: 校验 · 建 Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 生成 release notes 需要完整历史
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@v4
+        with:
+          # ⚠️ 这里可以用 `.nvmrc`（Node 22）—— 走的是 **pnpm** 的 OIDC 交换，与 npm CLI
+          # 的版本无关。若哪天改成 `npm publish`：Node 22 带的 npm 10.9.x **不支持**
+          # OIDC 换发布 token（要 >= 11.5.1），那时必须显式换成 Node 24。
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: 装依赖（冻结 lockfile）
+        run: pnpm install --frozen-lockfile
+
+      # 标签也可能打在一个坏提交上 ⇒ 校验与 CI 同款，一步不少。
+      - name: typecheck · format:check · test
+        run: |
+          pnpm typecheck
+          pnpm format:check
+          pnpm test
+
+      - name: 标签必须与 package.json 的版本逐字一致
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          tag="${TAG_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          echo "标签 v$tag / package.json $version"
+          [ "$tag" = "$version" ] || {
+            echo "::error::标签 v$tag 与 package.json 的 $version 不一致 —— npm 版本号不可重用，先对齐再发。"
+            exit 1
+          }
+
+      # ⚠️ 这里**真跑一次产物**读它自报的版本号，而不是去 grep 文件。
+      #
+      # 为什么：版本号是 esbuild 的 **define 常量** `__DRC_VERSION__` 注入的，
+      # 产物里**根本没有** `"version":"X"` 这种字段 ⇒ 早先那版判据（grep 那个字面量）**恒红**。
+      # 它在 relay 仓第一次真的打 tag 之前一直没暴露 —— **2026-10-10 发 3.1.0 才炸**
+      # （npm 发布与溯源那两步都过了，挂在建 Release 之前，Release 因此没建成）。
+      #
+      # `main.ts` 本来就有 `--version`：`docker run … --version` 是"最省事也最不会出错"的口径
+      # —— 它不监听端口（见 `src/main.ts:50`）。用它顺带把「define 压根没生效」也验掉了：
+      # 那种情况下 `--version` 会报 `0.0.0` 或拿不到值，而不是变成另一个假绿。
+      - name: 产物自报的版本号必须与 package.json 一致
+        run: |
+          set -e
+          want="$(node -p "require('./package.json').version")"
+          got="$(node dist/bundle/main.js --version)"
+          echo "产物自报 $got / package.json $want"
+          [ "$got" = "$want" ] || {
+            echo "::error::产物自报 $got，与 package.json 的 $want 不一致：先看 scripts/bundle-relay.mjs 的 define"
+            exit 1
+          }
+
+      - name: 建 GitHub Release 并挂上单文件产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        # ⚠️ **这一步也必须幂等**。发布那步是幂等的（版本已在注册表就跳过），
+        # 而 `gh release create` 在 Release 已存在时会 `422 already_exists` ⇒ 直接红。
+        # 那个失败形状很坏：**包已经发出去、attestation 也挂上了、Release 也在**，
+        # 唯独工作流是红的，看起来像"发布失败"，而版本号已经烧掉了。
+        # 触发路径很现实：工作流里改了对齐的东西，只能把 tag 移到新提交上重跑
+        # （`gh run rerun` 用的是打 tag 那个 commit 的定义，改了也不生效）。
+        run: |
+          set -e
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME 已存在：跳过创建（重跑不该因为它红）"
+            exit 0
+          fi
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --generate-notes \
+            dist/bundle/main.js
