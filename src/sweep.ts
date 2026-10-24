@@ -146,7 +146,8 @@ export function createSweep(deps: SweepDeps): {
    * 判活语义随之变化，而且是变慢的，必须写明白：`alive` 是"上一轮有没有回 pong"的
    * 单轮标志（这个结构没动，只是换了节奏），所以一条**静默死掉**的对端（没有 FIN/RST
    * 的半开 socket）要等它自己轮到两次才被发现——第一次清标志并 ping，第二次才发现没 pong。
-   * 最坏因此从 `2×sweepMs`（10 s）变成 `2×pingIntervalMs + pingTickMs`（默认约 121 s）。
+   * 最坏因此从 `2×sweepMs`（10 s）变成 `2×pingIntervalMs + pingTickMs`（默认约 61 s，
+   * 2026-10-24 起 ping 间隔 30s——移动 NAT 保活，见 config.ts 那段）。
    * 真机上的常规断开走 `close`/`error` 事件，不受影响；在意槽位回收速度的运维
    * 可以把 `DRC_PING_INTERVAL_MS` 调小（15 s 时回收最坏 31 s，突发仍是全表的 1/60）。
    * 保活只走 WS 层 ping：主机与小程序都不发应用层 ping，改判应用层心跳会

@@ -379,7 +379,18 @@ export function loadConfig(
     hostGraceMs: integer(env.DRC_HOST_GRACE_MS, 600_000, 'DRC_HOST_GRACE_MS', problems),
     sweepMs: integer(env.DRC_SWEEP_MS, 5_000, 'DRC_SWEEP_MS', problems),
     countersLogMs: integer(env.DRC_COUNTERS_LOG_MS, 60_000, 'DRC_COUNTERS_LOG_MS', problems),
-    pingIntervalMs: integer(env.DRC_PING_INTERVAL_MS, 60_000, 'DRC_PING_INTERVAL_MS', problems),
+    /**
+     * 保活 ping 的间隔（2026-10-24 从 60s 收到 30s）。
+     *
+     * 两个理由，都来自 2026-10-24 晚的真机切片：
+     * 1. **移动 NAT 保活**：运营商 NAT 的 TCP 空闲映射常见 30–60s 就回收——
+     *    60s 的 ping 间隔正好踩在地板上，映射被回收后 ping 全被丢弃 ⇒ 对端"无 pong"
+     *    ⇒ `heartbeat timeout` 踢掉（当晚 mvmaxgz2 两条 2–3 分钟长连接就是这么没的）。
+     *    30s 让映射一直有流量养着。
+     * 2. **死连接检出提速**：判定上界 ≈ 2×pingIntervalMs ⇒ 从约 121s 提到约 61s。
+     * 代价：ping 帧数量 ×2（每帧几字节，200 连接规模可忽略）。
+     */
+    pingIntervalMs: integer(env.DRC_PING_INTERVAL_MS, 30_000, 'DRC_PING_INTERVAL_MS', problems),
     pingTickMs: integer(env.DRC_PING_TICK_MS, 1_000, 'DRC_PING_TICK_MS', problems),
     maxBufferedBytes: integer(env.DRC_MAX_BUFFERED_BYTES, 1024 * 1024, 'DRC_MAX_BUFFERED_BYTES', problems),
     slowConsumerHostMs: integer(
