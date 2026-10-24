@@ -1884,9 +1884,9 @@ test('埋点：client disconnected 带 ip + onlineMs（"闪断"顺畅率判据�
 
 test('埋点：softwareVersion 无条件记（DRC_REPORT_VERSION 不再是闸）', async () => {
   /**
-   * 用户裁决（2026-10-23）："不用做开关，丰富埋点" ⇒ 对端**送来**就记，
-   * 不再看 `config.reportSoftwareVersion`。反例判据：默认配置（开关默认 false）
-   * 下必须照样记 —— 那正是"无条件"的含义。
+   * 用户裁决（2026-10-23）："不用做开关，丰富埋点" ⇒ 对端**送来**就记。
+   * （`config.reportSoftwareVersion` 死开关已于 2026-10-24 审计删除——
+   * 这条判据钉的是行为本体：**没有任何闸**能关掉记录。）
    */
   const infos = []
   const origInfo = Log.prototype.info
@@ -1894,7 +1894,7 @@ test('埋点：softwareVersion 无条件记（DRC_REPORT_VERSION 不再是闸）
     infos.push({ msg, fields })
     return origInfo.call(this, msg, fields)
   }
-  const ctx = await startRelay() // 不传 DRC_REPORT_VERSION ⇒ reportSoftwareVersion 默认 false
+  const ctx = await startRelay() // 无开关：对端送来就记
   try {
     const client = await Peer.connect(ctx.url)
     ctx.open.push(client)

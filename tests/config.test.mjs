@@ -166,24 +166,19 @@ test('端口也只认十进制字面量（`integer()` 那条纪律不许在 port
   }
 })
 
-test('版本上报开关**默认关**（开源版不记对端版本 ⇒ 零知识不变）', () => {
+test('版本上报**没有开关**（2026-10-23 裁决后：死配置字段已删）', () => {
   /**
-   * 2026-10-22：`hello` 帧加了 `softwareVersion`（**明文**帧 ⇒ 中继看得见）。
-   * 用户明确要求："不要在开源版本中记录这个值避免破坏零知识"。
+   * **B 口径翻转**（裁决出处：2026-10-23 用户"不用做开关，丰富埋点"）。
    *
-   * ⇒ 判据钉住「默认关」：
-   * ① 不设那个环境变量 ⇒ `reportSoftwareVersion` 为 false；
-   * ② 设成 `1` / `true`（大小写不敏感）⇒ 为 true；
-   * ③ 其它值（`0` / `yes` / 空串）⇒ 仍是 false（**不猜**）。
+   * 原判据钉的是 `reportSoftwareVersion` 开关的三态（默认关 / `1|true` 开 / 其它关），
+   * 而裁决后中继**无条件**记版本（relay.test.mjs 的「无条件记」反例判据钉着行为本体），
+   * 这个配置字段装配后**零消费者** —— 2026-10-24 审计把它连同注释、进口一起删了。
+   *
+   * 现在钉的是"删干净了"：字段不许回来（回来就是死开关复活），
+   * `DRC_REPORT_VERSION` 不许再影响 config（它的判定只剩 mp-upload 一处在用）。
    */
-  const { config } = load({})
-  assert.equal(config.reportSoftwareVersion, false, '默认关 ⇒ 开源版不记对端版本')
-  for (const raw of ['1', 'true', 'TRUE', 'True']) {
-    const { config: c } = load({ DRC_REPORT_VERSION: raw })
-    assert.equal(c.reportSoftwareVersion, true, `DRC_REPORT_VERSION=${raw} 应为开`)
-  }
-  for (const raw of ['0', 'false', 'yes', 'off', '', '  ']) {
-    const { config: c } = load({ DRC_REPORT_VERSION: raw })
-    assert.equal(c.reportSoftwareVersion, false, `DRC_REPORT_VERSION=${JSON.stringify(raw)} 应为关（不猜）`)
-  }
+  const { config } = load({ DRC_REPORT_VERSION: '1' })
+  assert.equal('reportSoftwareVersion' in config, false, '死开关不许复活：裁决后中继无条件记版本')
+  const plain = load({})
+  assert.equal('reportSoftwareVersion' in plain.config, false, '不设环境变量同样没有这个字段')
 })

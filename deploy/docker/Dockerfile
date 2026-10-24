@@ -50,7 +50,7 @@
 # 本仓与伞仓共用这份文件路径（`deploy/docker/Dockerfile`），但**两边各有一份内容**：
 # 伞仓那份（`/deploy/docker/`）保持 monorepo 形态给伞仓构建用；本仓这份从现在是
 # 独立仓形态——`COPY package.json pnpm-lock.yaml ./` 拷的是**本包**清单，
-# `@dsh-remote/protocol` 从 **npm** 装（devDependency，发版顺序 protocol 先行），
+# `@dsh-remote/protocol` 从 **npm** 装（devDependency；protocol **有改动时**才须先发 —— 2026-10-23 起两包版本不绑定同号，protocol 可落后），
 # `pnpm-lock.yaml` 由 `scripts/split-repos.mjs` 在暂存时生成并随仓跟踪（CI 的
 # `--frozen-lockfile` 依赖它）。两份 Dockerfile 的差异只有 build 阶段的 COPY 路径，
 # runtime 阶段逐字相同。
@@ -72,7 +72,8 @@ COPY pnpm-workspace.yaml ./
 #
 # `@dsh-remote/protocol` 是 devDependency、从 **npm** 装（不再是 workspace 软链）：
 # 单仓里没有它的源码，也不需要——它对 runtime 是零依赖（bundle 全内联）。
-# 发版顺序因此必须是 **protocol 先发**，本仓构建才能锁到同版本。
+# 发版顺序因此是：**protocol 有改动时必须先发它**，本仓构建才能锁到；
+# protocol 没改动时，本仓沿用 npm 上已有的旧版 protocol 即可（版本不绑定同号）。
 # 锁文件由 `scripts/split-repos.mjs` 暂存时 `pnpm install` 生成并随仓跟踪；
 # 在伞仓里它不存在（伞仓由根锁文件管），这是"两边各有一份内容"的一部分。
 RUN corepack enable && pnpm install --frozen-lockfile

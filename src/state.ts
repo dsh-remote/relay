@@ -636,8 +636,9 @@ export class RelayState implements Clock {
 
   /**
    * 删会话记录的唯一咽喉：**环形缓冲一起清**（作废时残留要一起清）。
-   * 五个删除点（空会话回收 / resync / 主动作废 / 闲置清扫 / 空会话清扫）——\n   * 「主机判死」2026-10-23 起不再是删除点（宽限期改挂起，见 `suspendExpiredHosts`）
-   * 全走这里——漏一处的形状是"会话没了、补帧环还在"，属于本仓咬过两次的那类残留。
+   * 五个删除点（空会话回收 / resync / 主动作废 / 闲置清扫 / 空会话清扫）全走这里；
+   * 「主机判死」2026-10-23 起不再是删除点（宽限期改挂起，见 `suspendExpiredHosts`）。
+   * 漏一处的形状是"会话没了、补帧环还在"，属于本仓咬过两次的那类残留。
    */
   private purgeConv(conversationId: string): void {
     this.conversations.delete(conversationId)

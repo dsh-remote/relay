@@ -26,7 +26,6 @@
  */
 
 import { MAX_RELAY_MESSAGE_BYTES } from '@dsh-remote/protocol/frames'
-import { reportSoftwareVersion } from '@dsh-remote/protocol/report-version'
 import { CLIENT_SLOW_CONSUMER_MS, HOST_SLOW_CONSUMER_MS } from './limits.js'
 
 export interface RelayConfig {
@@ -136,22 +135,6 @@ export interface RelayConfig {
   slowConsumerClientMs: number
   logLevel: LogLevel
   pairStatusEnabled: boolean
-  /**
-   * 是否**记录**对端报来的软件版本（2026-10-22）。
-   *
-   * ## 为什么要有这个开关
-   * `hello` 帧是**明文**控制帧 ⇒ 中继看得见 `softwareVersion`。
-   * ⇒ **默认关**（= 不记、不打日志）⇒ **开源版的中继不会因为这个字段多记任何东西**，
-   * 零知识不变。只有**私有部署**显式打开（`DRC_REPORT_VERSION=1`）才会记。
-   *
-   * ## 打开后能回答什么
-   * "这批人为什么配不上" —— 3.1.x 的插件配不上 3.2.x 的小程序，而**两端都不报错**。
-   * 记下版本就能按版本分组，一眼看出"这批全是老版本"，
-   * 而不必靠"重连时又去认领那张用过的码"（`already_used`）这种**间接症状**去反推。
-   *
-   * ⚠️ 它**不是**协议协商位：两端**永远不因它不同而拒连**。
-   */
-  reportSoftwareVersion: boolean
   /**
    * 会话表落盘路径。**空串 = 关闭**（默认）。
    *
@@ -413,10 +396,6 @@ export function loadConfig(
     ),
     logLevel: level,
     pairStatusEnabled: env.DRC_PAIR_STATUS === '1' || env.DRC_PAIR_STATUS === 'true',
-    // 默认关 ⇒ 开源版不记对端版本（零知识不变）；私有部署开这个才记。
-    // ⚠️ 判定**走 protocol 的共享实现**（插件/中继/小程序三处同一份）
-    // ⇒ 不会出现"我开了但没生效"这种极难查的分叉。
-    reportSoftwareVersion: reportSoftwareVersion(env),
     // 空串显式当作"关闭"：DRC_STATE_FILE= 也要能关掉，而不是被 ?? 还原成默认路径。
     stateFile: env.DRC_STATE_FILE ?? '',
     stateSaveMs: integer(env.DRC_STATE_SAVE_MS, 60_000, 'DRC_STATE_SAVE_MS', problems),
