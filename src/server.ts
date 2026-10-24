@@ -773,7 +773,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
       }
       return
     }
-    const claimed = state.claim(frame.pairingToken, peer.clientId)
+    // clientPub 一并交下去：它是幂等档的判别子（同一把公钥再来才是重试，见 state.claim）。
+    const claimed = state.claim(frame.pairingToken, peer.clientId, frame.clientPub)
     if (!claimed.ok) {
       /**
        * ⚠️ **内部原因不许原样出网**（D6）。`pair-fail` 的 reason 是**冻结消费面**
@@ -818,6 +819,23 @@ export function createRelay(config: RelayConfig): RelayHandle {
       return
     }
     peer.pairAttempts = 0
+    /**
+     * **幂等重认领档**（2026-10-24）：同一个 clientId 拿自己烧掉的码再来。
+     * 只回 `paired`（sessionId + hostId，都不是秘密）——**绝不重发 pair-grant**
+     * （psk 只随第一次的 clientPub 送过，重发给新公钥就是给冒名者开后门），
+     * 也不重发 peerJoined（D3 断连成员留着，主机那边一直认得它）。
+     * 这是掐死旧小程序客户端"重认领 → already_used → 断线 → 重连"死循环的那一下：
+     * 客户端拿到 `paired` 就把脏 token 清了，循环熄火。
+     */
+    if (claimed.idempotent) {
+      sendToPeer(peer, pairedFrameOf(claimed.conversationId, claimed.hostId))
+      log.info('pair claim replayed (idempotent)', {
+        clientId: peer.clientId,
+        sessionId: claimed.conversationId,
+        hostId: claimed.hostId,
+      })
+      return
+    }
     // 同一台手机重配到新会话时，它在旧会话里的成员记录已经被 claim 摘掉了（🟡7）。
     // 这里补上对旧主机的告知：与"客户端显式 session-leave"走同一条通知（`peer-left`），
     // 主机才知道少了这个观众，不必再往那个会话里推。（会话本身仍归主机。）

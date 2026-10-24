@@ -58,6 +58,26 @@ export interface PendingPair {
   used: boolean
   /** 首次签发时刻（同码重发**不**改写）：`claim` 用它算"码发了多久才被认领"（埋点，2026-10-23）。 */
   issuedAt: number
+  /**
+   * 烧掉这张码的 clientId 与它建出来的会话（2026-10-24）。
+   *
+   * 服务**幂等重认领**：同一个 clientId 拿自己烧掉的码再来（socket 抖动后的
+   * 重试，旧小程序客户端每连必发），把原会话还回去而不是 `already_used`。
+   * 这是掐死"重认领 → already_used → `_forgetPairing` 断线 → 重连 → ……"死循环
+   * 的中继侧防线（2026-10-24 晚 7 台真机的现场形状）。两个字段都**不是凭据**：
+   * 幂等档只回 sessionId/hostId，绝不重发 pair-grant（psk 只随第一次的
+   * clientPub 送过；重发给新公钥 = 给冒名者开后门）。
+   */
+  claimedBy?: string
+  claimedConv?: string
+  /**
+   * 认领时带的一次性公钥（scene 路线）——**幂等档的判别子**（2026-10-24 第二刀）。
+   * 同一把公钥再来 = 同一次认领的连接抖动重试（旧客户端每连必发）⇒ 幂等；
+   * **换了一把公钥**再来 = 新意图（"不一致"之后重扫 ⇒ 新的一次性密钥对）
+   * ⇒ 仍是 `already_used`，让用户拿新码 —— 幂等回 `paired` 但**不带 pair-grant**，
+   * 那种情况会把用户吊在"等确认码"上（mp-page-pairing 的「不一致后重扫」判据咬住了这一口）。
+   */
+  claimedPub?: string
 }
 
 /**
@@ -124,7 +144,15 @@ export interface Conversation {
 }
 
 export type ClaimResult =
-  | { ok: true; conversationId: string; hostId: string; detached: string[]; latencyMs: number }
+  | {
+      ok: true
+      conversationId: string
+      hostId: string
+      detached: string[]
+      latencyMs: number
+      /** 幂等重认领档（同 clientId 拿自己烧掉的码再来）：调用方**只回 `paired`，绝不重发 pair-grant**。 */
+      idempotent?: boolean
+    }
   | { ok: false; reason: PairRejectReason }
 
 /**
@@ -374,12 +402,36 @@ export class RelayState implements Clock {
   }
 
   /** 客户端认领配对码：一次性、TTL 内、主机在挂。成功即创建会话。 */
-  claim(token: string, clientId: string): ClaimResult {
+  claim(token: string, clientId: string, clientPub?: string): ClaimResult {
     const pending = this.pendingPairs.get(token)
     const now = this.now()
     if (!pending || pending.expiresAt < now) return { ok: false, reason: 'invalid_or_expired' }
-    // used 条目保留到 TTL 清扫，好让重放拿到 already_used 而不是 invalid_or_expired。
-    if (pending.used) return { ok: false, reason: 'already_used' }
+    /**
+     * used 条目保留到 TTL 清扫，好让重放拿到 already_used 而不是 invalid_or_expired。
+     *
+     * **同 clientId 重认领走幂等档**（2026-10-24）：烧码者自己拿着同一张码再来，
+     * 只可能是"socket 抖了、客户端在重试"（旧小程序客户端每连必发一次认领）——
+     * 把原会话还回去，客户端拿到 `paired` 就清脏 token，死循环熄火。
+     * 会话没了 / 不是本人 ⇒ 仍是 `already_used`（安全边界，判据钉着）。
+     */
+    if (pending.used) {
+      if (
+        pending.claimedBy === clientId &&
+        pending.claimedPub === clientPub &&
+        pending.claimedConv !== undefined &&
+        this.conversations.has(pending.claimedConv)
+      ) {
+        return {
+          ok: true,
+          idempotent: true,
+          conversationId: pending.claimedConv,
+          hostId: pending.hostId,
+          detached: [],
+          latencyMs: now - pending.issuedAt,
+        }
+      }
+      return { ok: false, reason: 'already_used' }
+    }
     const host = this.hosts.get(pending.hostId)
     if (!host || host.ws.readyState !== WS_OPEN) return { ok: false, reason: 'host_offline' }
 
@@ -420,6 +472,11 @@ export class RelayState implements Clock {
       upCount: 0,
       lastActivityAt: now,
     })
+    // 记下归属：这张码是谁烧的、建出了哪条会话、认领时用的哪把一次性公钥
+    // （幂等重认领的判别子，见 used 分支）。
+    pending.claimedBy = clientId
+    pending.claimedConv = conversationId
+    pending.claimedPub = clientPub
     return { ok: true, conversationId, hostId: pending.hostId, detached, latencyMs: now - pending.issuedAt }
   }
 

@@ -63,17 +63,85 @@ test('D1：待配对表里根本没有地方放 PSK（类型与运行时双重�
   assert.equal('psk' in entry, false)
 })
 
-test('配对码一次性：重放得到 already_used，而不是 invalid_or_expired', () => {
+test('配对码一次性：**别人**重放得到 already_used，而不是 invalid_or_expired', () => {
+  /**
+   * **B 口径翻转**（裁决出处：2026-10-24 晚「不顺」根因诊断 + 用户"动手修改"）。
+   *
+   * 原判据钉的是"任何重放都 already_used"——而 2026-10-24 晚的线上日志证明
+   * 这正是旧小程序客户端（3.2.11 前）死循环的燃料：socket 每抖一次就拿死码
+   * 再认领 → already_used → `_forgetPairing` 主动断线 → 重连 → 再认领……
+   * 一台手机 2 分钟转 7 圈。**同 clientId 重认领**现在走幂等档（回原会话），
+   * 这条判据收窄成"**别人**重放仍然 already_used"——那才是安全边界
+   * （不同 clientId 拿烧掉的码不许换到任何东西）。
+   */
   const { state, advance } = harness()
   state.issuePair('h1', '123456', 180_000)
   assert.equal(state.claim('123456', 'inst-1').ok, true)
-  const replay = state.claim('123456', 'inst-1')
+  const replay = state.claim('123456', 'inst-other')
   assert.equal(replay.ok, false)
-  assert.equal(replay.reason, 'already_used')
+  assert.equal(replay.reason, 'already_used', '别的 clientId 重放必须仍是 already_used')
   // used 条目留在表里直到 TTL 清扫——否则重放会被误报成"码不存在"，手机文案就错了（F6）。
   advance(180_001)
   const gone = state.claim('123456', 'inst-1')
   assert.equal(gone.reason, 'invalid_or_expired')
+})
+
+test('幂等重认领：同一 clientId 拿自己烧掉的码再认领 ⇒ 回原会话，不新建、不摘人', () => {
+  /**
+   * 掐死旧客户端死循环的**中继侧**修法（2026-10-24）：重认领是
+   * "连接抖动后的重试"而不是攻击——认领者与烧码者是**同一个 clientId**、
+   * 会话还活着 ⇒ 把原会话原样还回去（`idempotent` 档），客户端的
+   * `_onPaired` 拿到后清掉脏 token，循环当场熄火。
+   *
+   * ⚠️ 安全边界：**绝不重发 pair-grant**（psk 只随第一次的 clientPub 送过；
+   * 重发给新公钥 = 给冒名者开后门）。幂等档只回 `paired` 帧（sessionId + hostId，
+   * 都不是秘密）。detached 必须为空——幂等不许把人从旧会话里摘走。
+   */
+  const { state } = harness()
+  state.issuePair('h1', '123456', 180_000)
+  const first = state.claim('123456', 'inst-1')
+  assert.equal(first.ok, true)
+  const again = state.claim('123456', 'inst-1')
+  assert.equal(again.ok, true, '同 clientId 重认领必须成功（不是 already_used）')
+  assert.equal(again.idempotent, true, '必须走幂等档（调用方据此不重发 pair-grant）')
+  assert.equal(again.conversationId, first.conversationId, '回的必须是原会话')
+  assert.deepEqual(again.detached, [], '幂等不许摘人')
+  assert.equal(state.conversations.size, 1, '不许新建会话')
+})
+
+test('幂等重认领的边界：会话没了 / clientId 不同 ⇒ 退回 already_used', () => {
+  const { state } = harness()
+  state.issuePair('h1', '123456', 180_000)
+  const first = state.claim('123456', 'inst-1')
+  assert.equal(first.ok, true)
+  // ① 会话被清扫 ⇒ 不许指一条死会话回去
+  state.dropConversation(first.conversationId)
+  const dangling = state.claim('123456', 'inst-1')
+  assert.equal(dangling.ok, false)
+  assert.equal(dangling.reason, 'already_used', '原会话没了就退回 already_used')
+  // ② 冒名者（不同 clientId）永远拿不到幂等档
+  state.issuePair('h1', '654321', 180_000)
+  state.claim('654321', 'inst-2')
+  const impostor = state.claim('654321', 'inst-evil')
+  assert.equal(impostor.reason, 'already_used')
+})
+
+test('幂等档只认同一把一次性公钥：换钥重扫 ⇒ already_used（新意图，不许吊在等确认码）', () => {
+  /**
+   * 判别子的另一半（2026-10-24 第二刀，mp-page-pairing「不一致后重扫」判据咬出来的）：
+   * 同 clientId 但**换了公钥** = "不一致"之后重扫（`_startScenePair` 每次新生成密钥对）
+   * ⇒ 这是新意图，必须仍回 `already_used`（有声音的失败，引导拿新码）。
+   * 幂等回 `paired` 却不带 pair-grant 的话，用户会吊在"等确认码"上——比失败更糟。
+   */
+  const { state } = harness()
+  state.issuePair('h1', '123456', 180_000)
+  const first = state.claim('123456', 'inst-1', 'PUB-A')
+  assert.equal(first.ok, true)
+  const samePub = state.claim('123456', 'inst-1', 'PUB-A')
+  assert.equal(samePub.idempotent, true, '同一把公钥重认领 = 连接重试 ⇒ 幂等')
+  const freshPub = state.claim('123456', 'inst-1', 'PUB-B')
+  assert.equal(freshPub.ok, false)
+  assert.equal(freshPub.reason, 'already_used', '换钥重扫 = 新意图 ⇒ 有声音的失败')
 })
 
 test('多配对码并存：每张码各自独立，用哪张得到哪个主机的会话（旧事故回归）', () => {

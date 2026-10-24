@@ -289,7 +289,13 @@ test('配对前置：pair-begin 只能由主机发，认领只能由客户端发
   }
 })
 
-test('配对码：未知码 invalid_or_expired，重放 already_used（两个 reason 在理论文不同）', async () => {
+test('配对码：未知码 invalid_or_expired，**别人**重放 already_used，本人重放回原会话', async () => {
+  /**
+   * **B 口径翻转**（2026-10-24：掐死旧小程序客户端的"重认领死循环"）。
+   * 原判据钉"任何重放都 already_used"；现在线上日志证明那正是死循环的燃料
+   * （重认领 → already_used → `_forgetPairing` 断线 → 重连 → 再认领）。
+   * 同 clientId 重认领走幂等档（回 `paired`、原 sessionId），**别人**重放仍是 already_used。
+   */
   const ctx = await startRelay()
   try {
     const client = await Peer.connect(ctx.url)
@@ -299,12 +305,47 @@ test('配对码：未知码 invalid_or_expired，重放 already_used（两个 re
     client.send({ t: 'pair-begin-client', pairingToken: '999999' })
     assert.equal((await client.until((f) => f.t === 'pair-fail')).reason, 'invalid_or_expired')
 
+    // 本人重放 ⇒ 幂等 paired（原会话原样还回来）
     const first = await pairUp(ctx, { clientId: 'i4', token: '456789' })
     first.client.send({ t: 'pair-begin-client', pairingToken: '456789' })
-    assert.equal(
-      (await first.client.until((f) => f.t === 'pair-fail' && f.reason === 'already_used')).reason,
-      'already_used',
-    )
+    const again = await first.client.until((f) => f.t === 'paired' || f.t === 'pair-fail')
+    assert.equal(again.t, 'paired', `本人重放必须回 paired，实际 ${again.t}`)
+    assert.equal(again.sessionId, first.conversationId, '必须是原会话')
+
+    // 别人重放 ⇒ 仍然是 already_used（安全边界）
+    const other = await Peer.connect(ctx.url)
+    ctx.open.push(other)
+    other.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'i5' })
+    await other.until((f) => f.t === 'hello-ok')
+    other.send({ t: 'pair-begin-client', pairingToken: '456789' })
+    assert.equal((await other.until((f) => f.t === 'pair-fail')).reason, 'already_used')
+  } finally {
+    await ctx.close()
+  }
+})
+
+test('死循环熄火：断线重连后拿死码再认领 ⇒ 回 paired 而不是 pair-fail（旧客户端现场）', async () => {
+  /**
+   * 2026-10-24 晚线上现场的**行为级**复刻：旧小程序客户端（3.2.11 前）在每次
+   * socket 重连后的 hello-ok 都会拿 `_pendingToken` 再认领一次。原来每一轮都换来
+   * `already_used` → `_forgetPairing` 主动断线 → 又重连……一台手机 2 分钟转 7 圈。
+   * 现在中继对**本人**回幂等 `paired`：客户端清掉脏 token，循环熄火，
+   * 且**不会**有第二条会话被建出来（detachedFrom 那类副作用消失）。
+   */
+  const ctx = await startRelay()
+  try {
+    const first = await pairUp(ctx, { clientId: 'loop-1', token: '112233' })
+    // 断开（模拟网络抖动），同 clientId 重新连上
+    first.client.ws.close()
+    await new Promise((r) => setTimeout(r, 60))
+    const back = await Peer.connect(ctx.url)
+    ctx.open.push(back)
+    back.send({ t: 'hello', role: 'client', protocol: PROTOCOL_VERSION, clientId: 'loop-1' })
+    await back.until((f) => f.t === 'hello-ok')
+    back.send({ t: 'pair-begin-client', pairingToken: '112233' })
+    const verdict = await back.until((f) => f.t === 'paired' || f.t === 'pair-fail')
+    assert.equal(verdict.t, 'paired', `重连后认领必须回 paired，实际 ${verdict.t} ${verdict.reason ?? ''}`)
+    assert.equal(verdict.sessionId, first.conversationId, '回的必须是原会话')
   } finally {
     await ctx.close()
   }
