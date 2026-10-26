@@ -7,14 +7,16 @@
  *
  * ⚠️ **行为零变化**（R3 纪律）：判据一片未动照样全绿。
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
+import { FEEDBACK_TEXT_MAX } from '@dsh-remote/protocol/frames'
 import type { RelayConfig } from './config.js'
 import type { RelayState } from './state.js'
 import type { Budget } from './limits.js'
 import type { Log } from './log.js'
 import type { MpCodeIssuer } from './mpcode.js'
+import type { FeedbackStore } from './feedback.js'
 
 /** 认领限频表的容量上限：满了就丢最旧的一批（`Map` 保持插入顺序）。 */
 const CLAIM_TRACK_MAX = 10_000
@@ -38,6 +40,10 @@ export interface HttpRoutesDeps {
   mpCodes: MpCodeIssuer
   pairStatusBudget: Budget
   persistence: { enabled: boolean; restored: number; savedAt: number; writes: number; failures: number }
+  /** 反馈存储（2026-10-26）。运维读与回都走它。 */
+  feedback: FeedbackStore
+  /** 回一条反馈（server.ts 负责落盘 + 推给在线的手机）。 */
+  replyToFeedback(id: string, text: string): { ok: boolean; error?: string; clientId?: string }
   getShuttingDown(): boolean
   startedAt: number
   getLastPingAt(): number
@@ -53,6 +59,33 @@ export function createHttpRoutes(deps: HttpRoutesDeps): {
 
   function newHostToken(): string {
     return randomBytes(24).toString('hex')
+  }
+
+  /**
+   * 运维接口的令牌闸（2026-10-26，反馈面）。
+   *
+   * ## 为什么必须有
+   *
+   * `/api/feedback*` 是**唯一**能读全部反馈（明文）的地方。生产上中继的 HTTP
+   * 端口只绑回环（docker 映射到 127.0.0.1），但反代 `/v05/` 是**公网可达**的
+   * ⇒ 没有令牌就等于把所有人的意见公开。
+   *
+   * ## 三条纪律
+   *
+   * ① **没配令牌 ⇒ 这些路由一律 404**（不是 401）。404 意味着"这台机器上没有
+   *    这个东西"，401 意味着"有，但你没证明你是谁"——后者会告诉探测者
+   *    "这里有一条管理接口"，那是没必要的暴露面。
+   * ② 令牌走**请求头**（`x-drc-admin-token`），不走 query：query 会落进
+   *    nginx 的访问日志，那等于把管理令牌写进日志文件。
+   * ③ 定长比较（`timingSafeEqual`）：短令牌也要比出等长，否则比较耗时随前缀长度变化。
+   */
+  function adminAuthorized(req: IncomingMessage): boolean {
+    const token = deps.config.adminToken
+    if (token === '') return false
+    const header = req.headers['x-drc-admin-token']
+    const got = Array.isArray(header) ? (header[0] ?? '') : (header ?? '')
+    if (typeof got !== 'string' || got.length !== token.length) return false
+    return timingSafeEqual(Buffer.from(got, 'utf8'), Buffer.from(token, 'utf8'))
   }
 
   /**
@@ -186,6 +219,64 @@ export function createHttpRoutes(deps: HttpRoutesDeps): {
    * 也动不了别人的 hostId 那枚；而被顶掉的那台**会自愈**（3.1.4 起，插件侧收到
    * `bad_token` 就带自己的 hostId 重新认领 —— 见 `packages/plugin/src/index.ts`）。
    */
+  /**
+   * 回一条反馈（2026-10-26）。体：`{id, text}`。
+   *
+   * 校验做三件：id 非空、text 非空且不超长（回给用户看的东西也要有上限）。
+   * 找不到 id ⇒ 404（不是 500：那是"你说的那条不存在"，服务端没坏）。
+   */
+  async function handleFeedbackReply(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      res.statusCode = 405
+      res.end(JSON.stringify({ error: 'use POST' }))
+      return
+    }
+    let body: Record<string, unknown> = {}
+    let raw: string
+    try {
+      raw = await readBody(req, CLAIM_BODY_MAX_BYTES)
+    } catch (error) {
+      if ((error as { code?: unknown } | null)?.code === BODY_TOO_LARGE) {
+        res.statusCode = 413
+        res.setHeader('connection', 'close')
+        res.end(JSON.stringify({ error: 'body_too_large', limitBytes: CLAIM_BODY_MAX_BYTES }))
+        return
+      }
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'bad_body' }))
+      return
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        body = parsed as Record<string, unknown>
+      }
+    } catch {
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'bad_json' }))
+      return
+    }
+    const id = typeof body.id === 'string' ? body.id.trim() : ''
+    const text = typeof body.text === 'string' ? body.text.trim() : ''
+    if (id === '' || text === '') {
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'need_id_and_text' }))
+      return
+    }
+    if (text.length > FEEDBACK_TEXT_MAX) {
+      res.statusCode = 400
+      res.end(JSON.stringify({ error: 'text_too_long', limit: FEEDBACK_TEXT_MAX }))
+      return
+    }
+    const result = deps.replyToFeedback(id, text)
+    if (!result.ok) {
+      res.statusCode = 404
+      res.end(JSON.stringify({ error: result.error ?? 'not_found' }))
+      return
+    }
+    res.end(JSON.stringify({ ok: true, id, clientId: result.clientId ?? null }))
+  }
+
   async function handleClaimToken(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') {
       res.statusCode = 405
@@ -453,6 +544,69 @@ export function createHttpRoutes(deps: HttpRoutesDeps): {
         const token = url.searchParams.get('token') ?? ''
         const entry = deps.state.pendingPairs.get(token)
         res.end(JSON.stringify({ ok: !!entry && !entry.used && entry.expiresAt >= Date.now() }))
+        return
+      }
+      /**
+       * 运维：读全部反馈（2026-10-26，反馈面）。
+       *
+       * 这条接口是**明文**的（反馈本来就是明文）⇒ 它必须被令牌闸住，
+       * 而且令牌没配时**整条路由不存在**（404，见 `adminAuthorized` 的注释）。
+       *
+       * 读数按 SLA 口径给：`open`（还没回）、`overdue`（超过 24 小时还没回）。
+       * 承诺 24 小时这件事要能被别人看见 —— 一条没人查的承诺等于没有承诺。
+       */
+      if (url.pathname === '/api/feedback') {
+        if (!adminAuthorized(req)) {
+          // 没配令牌 = 这台机器上没有这个接口（404，不是 401）。
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'not_found' }))
+          return
+        }
+        const now = Date.now()
+        const sla = deps.feedback.slaCounts(now)
+        const items = deps.feedback.listAll().map((entry) => ({
+          id: entry.id,
+          clientId: entry.clientId,
+          ip: entry.ip,
+          text: entry.text,
+          contact: entry.contact ?? null,
+          at: entry.at,
+          ageSec: Math.round((now - entry.at) / 1000),
+          status: entry.status,
+          reply: entry.reply ?? null,
+          repliedAt: entry.repliedAt ?? null,
+          overdue: entry.status === 'open' && now - entry.at > sla.slaHours * 3_600_000,
+        }))
+        res.end(
+          JSON.stringify({
+            total: items.length,
+            open: sla.open,
+            overdue: sla.overdue,
+            slaHours: sla.slaHours,
+            items,
+          }),
+        )
+        return
+      }
+      /**
+       * 运维：回一条反馈（2026-10-26）。
+       *
+       * 回完立刻推给那台在线的手机（server.ts 的 `replyToFeedback`），
+       * 离线也没关系——手机下次 poll 会看到（回复是状态，不是一次性事件）。
+       */
+      if (url.pathname === '/api/feedback/reply') {
+        if (!adminAuthorized(req)) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'not_found' }))
+          return
+        }
+        void handleFeedbackReply(req, res).catch((e: unknown) => {
+          deps.log.warn('feedback reply failed', { message: String((e as Error)?.message ?? e) })
+          if (!res.headersSent) {
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: 'internal' }))
+          }
+        })
         return
       }
       res.statusCode = 404

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.4 —— 反馈面：收得到、存得下、回得去（承诺 24 小时）
+
+> ⚠️ **本包不发 npm**（2026-10-23 用户裁决：中继是自部署服务）：分发形态是
+> **Docker 镜像**（`dsh-remote-relay:<version>`）与 **GitHub Release 的自包含单文件**。
+
+### 新增三帧
+
+`feedback`（端点→中继，提交）、`feedback-poll`（端点→中继，拉取）、`feedback-list`（中继→端点）。
+中继在 `hello-ok.capabilities` 里声明 `feedback.v1` —— 小程序**按声明开**：
+老中继不声明 ⇒ 入口不出现、也不发帧（对着没实现的端点发帧只会换来一句 `unknown_frame`）。
+
+### 资格：只有配对成功的人才有权限提反馈
+
+中继以"这个 clientId 是不是某条活跃会话的成员"为凭据（`state.conversationOfClient`）——
+那需要真走过一次扫码 + SAS 确认，不是自报能伪造的（客户端的 clientId 是自报的）。
+未配对 ⇒ 回 **`not_paired`**（**不是** `unknown_session`：后者会让客户端清配对要求重扫，
+而这里配对是好的，只是没资格做）。
+
+### 存储：独立文件、独立失败域
+
+反馈落 `feedback.json`（`DRC_FEEDBACK_FILE`，缺省在 `DRC_STATE_FILE` 同目录），
+**不进 `state.json`** —— 会话表有严格的形状闸，自由文本的形状闸完全是另一回事，
+混在一起会污染那条纪律。坏文件按空处理（不抛：起不来的中继等于整个产品停摆）。
+
+### 限频（客户端无鉴权）
+
+每个 clientId 每小时 5 条、每个 IP 每小时 10 条（滑动窗口），全局 2000 条上限（满了丢最旧的）。
+**先判后占**：被拒的提交不消耗配额。闸门用尽回 `rate_limited`（出声，不静默丢）。
+
+### 运维接口（承诺要能查）
+
+- `GET /api/feedback` —— 全部反馈 + SLA 计数（`open` / `overdue` / `slaHours`）。
+- `POST /api/feedback/reply` —— 回一条（`{id, text}`），回完**立刻推给那台在线的手机**。
+
+两条都要 `x-drc-admin-token` 请求头（`DRC_ADMIN_TOKEN`）；**没配令牌 ⇒ 一律 404**
+（不是 401：401 会告诉探测者"这里有管理接口"）。令牌走请求头不走 query ——
+query 会落进反代的访问日志。
+
 ## 3.2.14 —— `/code` 拒渲染死码 + 主机宽限改「挂起、回来可恢复」
 
 > ⚠️ **本包不发 npm**（2026-10-23 用户裁决：中继是自部署服务）：分发形态是

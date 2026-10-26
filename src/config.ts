@@ -154,6 +154,33 @@ export interface RelayConfig {
    * 60 s 的粒度相对 7 天的 TTL 相当于无穷小。
    */
   stateSaveMs: number
+  /**
+   * 反馈落盘路径（2026-10-26）。**空串 = 只在内存里**（不落盘）。
+   *
+   * 独立于 `stateFile`：反馈是**自由文本**，它的形状闸与会话表完全不是一回事
+   * （见 `feedback.ts` 的文件头）。另起一个文件 ⇒ **独立失败域**：
+   * 反馈文件坏了，会话表照常恢复。
+   *
+   * 缺省时从 `stateFile` 的目录推出来（`feedback.json`）；两个都没设 ⇒ 纯内存。
+   */
+  feedbackFile: string
+  /** 反馈的全局条数上限（满了丢最旧的）。 */
+  feedbackMaxEntries: number
+  /** 每个 clientId 每小时最多几条反馈。 */
+  feedbackPerClientPerHour: number
+  /** 每个来源 IP 每小时最多几条反馈。 */
+  feedbackPerIpPerHour: number
+  /**
+   * 运维接口（`/api/feedback*`）的管理令牌。**空串 = 那些接口一律 404**。
+   *
+   * 为什么必须要有令牌：反馈是**明文**，那两条接口是唯一能读全部反馈的地方。
+   * 中继的 HTTP 端口在生产上只绑 127.0.0.1（docker 映射到回环），但反代
+   * `/v05/` 是公网可达的 ⇒ 没有令牌就等于把所有人的意见公开。
+   *
+   * 令牌走**请求头**（`x-drc-admin-token`）而不是 query：query 会落进 nginx
+   * 的访问日志（那等于把管理令牌写进日志文件）。
+   */
+  adminToken: string
   version: string
 }
 
@@ -213,6 +240,23 @@ function claimMinIntervalMs(env: Record<string, string | undefined>, problems: C
     })
   }
   return value
+}
+
+/**
+ * 反馈文件的缺省路径。
+ *
+ * 规则：显式给了 `DRC_FEEDBACK_FILE` 就用它；否则从 `DRC_STATE_FILE` 的**目录**推
+ * （`feedback.json`）；两个都没有 ⇒ 空串（纯内存，不落盘）。
+ *
+ * 为什么从 stateFile 推而不是给个绝对路径：部署时 `DRC_STATE_FILE` 已经指着
+ * 挂载卷里的那个目录了，从它推可以让反馈与会话**落在同一个卷**（备份/清理
+ * 是一起的事），而运维不用多记一个路径。
+ */
+function defaultFeedbackFile(stateFile: string): string {
+  if (stateFile === '') return ''
+  const slash = stateFile.lastIndexOf('/')
+  const dir = slash > 0 ? stateFile.slice(0, slash) : '.'
+  return `${dir}/feedback.json`
 }
 
 function integer(
@@ -410,6 +454,12 @@ export function loadConfig(
     // 空串显式当作"关闭"：DRC_STATE_FILE= 也要能关掉，而不是被 ?? 还原成默认路径。
     stateFile: env.DRC_STATE_FILE ?? '',
     stateSaveMs: integer(env.DRC_STATE_SAVE_MS, 60_000, 'DRC_STATE_SAVE_MS', problems),
+    // 反馈：路径缺省从 stateFile 的目录推；两个都没设 ⇒ 纯内存（不落盘）。
+    feedbackFile: env.DRC_FEEDBACK_FILE ?? defaultFeedbackFile(env.DRC_STATE_FILE ?? ''),
+    feedbackMaxEntries: integer(env.DRC_FEEDBACK_MAX_ENTRIES, 2_000, 'DRC_FEEDBACK_MAX_ENTRIES', problems),
+    feedbackPerClientPerHour: integer(env.DRC_FEEDBACK_PER_CLIENT_HOUR, 5, 'DRC_FEEDBACK_PER_CLIENT_HOUR', problems),
+    feedbackPerIpPerHour: integer(env.DRC_FEEDBACK_PER_IP_HOUR, 10, 'DRC_FEEDBACK_PER_IP_HOUR', problems),
+    adminToken: env.DRC_ADMIN_TOKEN ?? '',
     version,
   }
 

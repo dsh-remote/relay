@@ -23,6 +23,7 @@ import { type EndpointFrame, type ErrorCode, type RelayFrame, type StatusDigest 
 import { newHostId } from '@dsh-remote/protocol/ids'
 import { negotiateProtocol, PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
 import { createMpCodeIssuer } from './mpcode.js'
+import { FeedbackStore } from './feedback.js'
 import { createHttpRoutes } from './http-routes.js'
 import { createSweep } from './sweep.js'
 import { wantsRetryAfter } from '@dsh-remote/protocol/errors'
@@ -31,6 +32,7 @@ import {
   encBatchToRelay,
   encToClient,
   encToRelay,
+  feedbackList as feedbackListFrameOf,
   helloOkForClient,
   helloOkForHost,
   makeError as makeErrorFrame,
@@ -191,6 +193,20 @@ export function createRelay(config: RelayConfig): RelayHandle {
   /** `/api/pair-status` 的独立配额：它走 HTTP、无认证，和配对帧不是同一条入口。 */
   const pairStatusBudget = new Budget(config.pairStatusBudgetPerSec)
   const peers = new WeakMap<WebSocket, Peer>()
+  /**
+   * 反馈存储（2026-10-26）。**明文**的独立失败域，文件与 state.json 分开。
+   *
+   * 启动读回放在这里（与 `restoreState` 同一时机：listen 之前，还没有 socket 能进来）。
+   * 路径为空（`DRC_STATE_FILE` 与 `DRC_FEEDBACK_FILE` 都没设）⇒ 只在内存里。
+   */
+  const feedback = new FeedbackStore({
+    path: config.feedbackFile,
+    maxEntries: config.feedbackMaxEntries,
+    perClientPerHour: config.feedbackPerClientPerHour,
+    perIpPerHour: config.feedbackPerIpPerHour,
+    log,
+  })
+  feedback.load()
   let shuttingDown = false
   let sweepTimer: NodeJS.Timeout | undefined
   let pingTimer: NodeJS.Timeout | undefined
@@ -482,6 +498,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
     history_window_exceeded: '断线时间太长，中间那段已经补不回来了，正在重新拉取',
     pair_table_full: '配对表已满，请稍后再试',
     need_client: '需要先从手机侧发起配对',
+    // 反馈面（2026-10-26）：**绝不能**让客户端把它当成"配对失效"——
+    // `unknown_session` 会触发"清配对并要求重扫"，而这里配对是好的，
+    // 只是这一条业务动作没资格做（提示"先配对再反馈"就够了）。
+    not_paired: '请先完成配对后再提交反馈',
     unsupported_protocol: '中继与手机的协议版本不兼容，请把小程序升级到最新版',
     internal: '中继内部错误',
   }
@@ -1229,6 +1249,78 @@ export function createRelay(config: RelayConfig): RelayHandle {
         markStateChanged()
         return
       }
+      /**
+       * 提交一条反馈（2026-10-26）。**明文**——这是中继唯一读得懂的自由文本。
+       *
+       * ## 资格闸：**必须已配对**（产品裁决）
+       *
+       * 判据是"这个 clientId 是不是某条活跃会话的成员"
+       * （`state.conversationOfClient`）。成员身份不是自报能拿到的 ——
+       * 它要求真走过一次扫码 + SAS 确认（`claim()` 里由主机授权写入成员表）。
+       *
+       * 为什么要这道门：客户端**无鉴权**（clientId 是自报的，见 handleHello 客户端分支），
+       * 没有这道门的话这就是一台公网留言板。
+       *
+       * ## 幂等：同 id 再来一次 = 重发，不是新的一条
+       *
+       * 小程序在网络抖动时会重发同一条；重发不该变成两条反馈（用户只按了一次）。
+       * 而"用户看到失败又按一次"会生成**两个不同的 id**（那是两条反馈，不该被合并）。
+       */
+      case 'feedback': {
+        if (peer.role !== 'client' || !peer.clientId) {
+          sendError(peer, 'need_client')
+          return
+        }
+        if (state.conversationOfClient(peer.clientId) === undefined) {
+          // 未配对 ⇒ 没资格。回 `not_paired`（**不是** `unknown_session`：
+          // 后者会让客户端清配对要求重扫，而这里配对是好的）。
+          sendError(peer, 'not_paired')
+          return
+        }
+        const added = feedback.add(
+          peer.clientId,
+          peer.ip,
+          { id: frame.id, text: frame.text, contact: frame.contact },
+          Date.now(),
+        )
+        if (!added.ok) {
+          if (added.reason === 'duplicate') {
+            // 重发：回一份当前列表（内容不变），不当失败。
+            sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
+            return
+          }
+          // 限频：**出声**（rate_limited 带 retryAfterMs），不静默丢 ——
+          // 静默丢会让用户以为提交成功了。
+          sendError(peer, 'rate_limited', undefined, undefined, 60_000)
+          return
+        }
+        const sla = feedback.slaCounts(Date.now())
+        log.info('feedback received', {
+          id: frame.id,
+          clientId: peer.clientId,
+          chars: frame.text.length,
+          hasContact: frame.contact !== undefined ? 1 : 0,
+          open: sla.open,
+          overdue: sla.overdue,
+        })
+        // 回包：把"我的反馈"整份发回去（用户立刻能看到"已收到"）。
+        sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
+        return
+      }
+      /**
+       * 拉取"我的反馈"（含已回复的那些）。
+       *
+       * 列表**只含这个 clientId 自己的**条目（`listFor` 里按 clientId 过滤）——
+       * 反馈是明文，"谁能看到谁的反馈"必须在中继这一侧就定死。
+       */
+      case 'feedback-poll': {
+        if (peer.role !== 'client' || !peer.clientId) {
+          sendError(peer, 'need_client')
+          return
+        }
+        sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
+        return
+      }
       case 'ping':
         return sendToPeer(peer, pongFrameOf(frame.ts))
       default:
@@ -1471,6 +1563,38 @@ export function createRelay(config: RelayConfig): RelayHandle {
 
   // ── HTTP（v5 R3 抽出 → `http-routes.ts`）────────────────────────────
   const mpCodes = createMpCodeIssuer({ appId: config.mpAppId, secret: config.mpSecret, envVersion: config.mpEnv })
+  /**
+   * 回一条反馈（运维面）。返回 `{ok, error?}`。
+   *
+   * 回完之后**顺手推给那台在线的手机**（`feedback-list`）——用户提交完意见
+   * 很可能还开着小程序，这时他应该立刻看到"我们收到并回复了"。
+   * 手机不在线也没关系：它下次 poll 会拿到同一份列表（回复是**状态**，
+   * 不是一次性事件 —— 所以列表是权威，推送只是加速）。
+   */
+  function replyToFeedback(id: string, text: string): { ok: boolean; error?: string; clientId?: string } {
+    const entry = feedback.get(id)
+    if (entry === undefined) return { ok: false, error: 'not_found' }
+    const now = Date.now()
+    if (!feedback.reply(id, text, now)) return { ok: false, error: 'not_found' }
+    const sock = state.clients.get(entry.clientId)?.ws
+    if (sock !== undefined) {
+      try {
+        sendTo(sock, feedbackListFrameOf(feedback.listFor(entry.clientId)))
+      } catch (e) {
+        // 推不出去不是回复失败（回复已经落盘了，手机下次 poll 会看到）。
+        log.warn('feedback reply push failed', { id, message: String((e as Error)?.message ?? e) })
+      }
+    }
+    const sla = feedback.slaCounts(now)
+    log.info('feedback replied', {
+      id,
+      clientId: entry.clientId,
+      online: sock !== undefined ? 1 : 0,
+      overdue: sla.overdue,
+    })
+    return { ok: true, clientId: entry.clientId }
+  }
+
   const { handler: httpHandler, health } = createHttpRoutes({
     config,
     state,
@@ -1479,6 +1603,8 @@ export function createRelay(config: RelayConfig): RelayHandle {
     mpCodes,
     pairStatusBudget,
     persistence,
+    feedback,
+    replyToFeedback,
     getShuttingDown: () => shuttingDown,
     startedAt,
     getLastPingAt: () => sweepMod.getLastPingAt(),
