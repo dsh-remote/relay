@@ -138,6 +138,15 @@ interface Peer {
   notedFrameFlood: boolean
   /** 同上：`enc from non-member` 一条连接只记一次。 */
   notedNonMember: boolean
+  /**
+   * "这条连接上已经报过一次 unknown_session"（2026-10-26 补）。
+   *
+   * 为什么要有这道闩锁：`unknown_session` 是**逐帧**判定（手机拿着一个已死的 convId
+   * 再发一帧就撞一次），而它是"用户被迫重扫"的**唯一**直接信号 —— 不记它，
+   * 线上就数不出"有多少次用户被迫重新扫码"。但一个拿着死 convId 的对端可以
+   * 连打几百帧 ⇒ 与 `notedNonMember` 同一条纪律：**只记一次**。
+   */
+  notedUnknownSession: boolean
   /** 配对表满的告警只记一次（逐帧判定，见 handlePairBegin）。 */
   notedPairTableFull: boolean
   /** 同上：全局配对配额用尽那条 warn，每秒最多一行（0 = 还没记过）。 */
@@ -958,6 +967,25 @@ export function createRelay(config: RelayConfig): RelayHandle {
         peer.notedNonMember = true
         log.warn('enc from non-member', { sessionId: frame.sessionId, clientId: peer.clientId, role: peer.role })
       }
+      /**
+       * `unknown_session` = **用户被迫重扫**的那一下（2026-10-26 补）。
+       *
+       * 客户端收到它会 `_forgetPairing()` 并提示"会话已失效，请重新配对" ——
+       * 也就是"用着用着断了、只能回到电脑前重扫"的第一号现场。
+       * 此前中继**一条都不记**：那个数字只能从"手机说它断了"倒推，
+       * 而线上没有第二个来源 ⇒ 它**数不出来**。
+       *
+       * 与 `not_member` 同纪律：逐帧判定 ⇒ 只记一次（一个拿着死 convId 的对端
+       * 能连打几百帧）。
+       */
+      if (rejected === 'unknown_session' && !peer.notedUnknownSession) {
+        peer.notedUnknownSession = true
+        log.info('unknown session', {
+          sessionId: frame.sessionId,
+          clientId: peer.clientId,
+          role: peer.role,
+        })
+      }
       return
     }
     if (peer.role === 'client') {
@@ -1202,6 +1230,10 @@ export function createRelay(config: RelayConfig): RelayHandle {
           }
           log.info('conversation voided by host', {
             sessionId: frame.sessionId,
+            // ⚠️ **hostId 是这条日志的"谁"**（2026-10-26 补）：原来只有 sessionId
+            // 与客户端数，于是"93 次作废"只能靠时间线反推是哪台主机（本次分析里
+            // 78/93 靠"上线后 120 秒内"猜出来）⇒ 归因永远是猜的。
+            hostId: peer.hostId,
             clients: (dropped?.clientIds ?? []).length,
           })
           // 主机作废 = 永久删除。不同步删盘的话重启会把它读回来（验收第 5 条）。
@@ -1220,6 +1252,20 @@ export function createRelay(config: RelayConfig): RelayHandle {
           // （2026-10-05 用户报）。socket 关闭那条路**不带**这个标记 —— 那条是掉线，
           // D3 要求会话留着，回前台还要用同一把钥匙。
           sendTo(state.hostSocket(frame.sessionId), peerLeftFrame(frame.sessionId, peer.clientId, true))
+          /**
+           * 客户端**主动离开**一条会话（2026-10-26 补）。
+           *
+           * 为什么必须记：主机收到 `peer-left(unpaired)` 会**作废**这条会话
+           * （见 plugin/transport/relay.ts）⇒ 中继侧随后就有一条
+           * "conversation voided by host"。**只看那一条会得出相反的结论**：
+           * "主机把会话作废了，用户被迫重扫" —— 而真相常常是"**用户自己解的配**"，
+           * 作废只是收尾。⇒ 这条把"谁先动的手"记下来，两者才能分开。
+           */
+          log.info('session left by client', {
+            sessionId: frame.sessionId,
+            clientId: peer.clientId,
+            hostId: state.conversations.get(frame.sessionId)?.hostId,
+          })
           // 成员表变了（少一个人），且可能顺带打上了空会话回收计时——两者都要落盘。
           markStateChanged()
         }
@@ -1378,6 +1424,7 @@ export function createRelay(config: RelayConfig): RelayHandle {
       // 一条未认证连接就能把 journald 的条数额度吃干净（见各自注释）。
       notedFrameFlood: false,
       notedNonMember: false,
+      notedUnknownSession: false,
       notedPairTableFull: false,
       pairBudgetWarnedAt: 0,
       tableFullWarnedAt: 0,
