@@ -221,6 +221,46 @@ test('存储：回复推进到 replied，不覆盖原话；SLA 按 24 小时口�
   assert.equal(store.reply('fb_不存在', 'x', 1), false, '回一条不存在的 ⇒ 失败而不是新建')
 })
 
+test('落盘往返：带**回复**的那条也要原样回来（2026-10-26 线上事故的判据）', () => {
+  // ⚠️ 这条判据是**线上事故逼出来的**：0.5.4 的 sanitizeEntry 里把 `raw.reply`
+  // 写成了 `raw.raw`（笔误）⇒ 凡是带回复的条目读回时全被丢（`dropped: 1, kept: 0`）。
+  // 而当时的判据只验了"内存里回复推进到 replied"，**没走 save → load 的往返**
+  // —— 丢字段的地方恰恰是往返。
+  // ⇒ 这条钉住：**带回复、带联系方式的条目**写盘再读回来必须一字不差。
+  const dir = tmpDir()
+  try {
+    const p = join(dir, 'feedback.json')
+    const store = new FeedbackStore({
+      path: p,
+      maxEntries: 10,
+      perClientPerHour: 5,
+      perIpPerHour: 10,
+      log: quietLog(),
+    })
+    store.add('c-1', '1.1.1.1', { id: 'fb_open', text: '还没回的' }, 1000)
+    store.add('c-1', '1.1.1.1', { id: 'fb_done', text: '已经回的', contact: 'a@b.c' }, 1001)
+    store.reply('fb_done', '收到，下一版就改', 1002)
+
+    const restored = new FeedbackStore({
+      path: p,
+      maxEntries: 10,
+      perClientPerHour: 5,
+      perIpPerHour: 10,
+      log: quietLog(),
+    })
+    const kept = restored.load()
+    assert.equal(kept, 2, `两条都要回来（线上那次是 kept: 0, dropped: 1）`)
+    const done = restored.listFor('c-1').find((i) => i.id === 'fb_done')
+    assert.ok(done, '带回复的那条必须在')
+    assert.equal(done.status, 'replied')
+    assert.equal(done.reply, '收到，下一版就改', '回复正文不能丢')
+    assert.equal(done.contact, 'a@b.c', '联系方式不能丢')
+    assert.equal(done.repliedAt, 1002, '回复时刻不能丢')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('落盘：写出来再读回来还是那几条；坏文件按空处理（不抛）', () => {
   const dir = tmpDir()
   try {

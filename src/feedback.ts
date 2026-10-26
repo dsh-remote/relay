@@ -362,10 +362,18 @@ function sanitizeEntry(item: unknown): FeedbackEntry | undefined {
   if (typeof raw.at !== 'number' || !Number.isFinite(raw.at) || raw.at < 0) return undefined
   if (raw.status !== 'open' && raw.status !== 'replied') return undefined
   if (raw.contact !== undefined && (typeof raw.contact !== 'string' || raw.contact.length > 120)) return undefined
-  if (
-    raw.reply !== undefined &&
-    (typeof raw.raw !== 'string' || typeof raw.reply !== 'string' || raw.reply.length > 2000)
-  ) {
+  // ⚠️ **这里曾经有一个笔误**（2026-10-26 线上抓到）：条件里写的是 `raw.raw`
+  // 而不是 `raw.reply` ⇒ `raw.raw` 恒为 undefined ⇒ `typeof undefined !== 'string'`
+  // 恒真 ⇒ **凡是带回复的条目全部被丢**（线上那次 `dropped: 1, kept: 0`）。
+  // ⇒ 症状：用户提了反馈、我们回了、中继重启 ⇒ 那条反馈**连同回复一起消失**。
+  // 之所以没被本地判据抓到：那条判据只验了"内存里回复推进到 replied"，
+  // **没有走 save → load 的往返** —— 丢字段的地方恰恰是往返。
+  if (raw.reply !== undefined && (typeof raw.reply !== 'string' || raw.reply.length > 2000)) {
+    return undefined
+  }
+  // `status==='replied'` 却**没有**回复正文 = 自相矛盾的条目（界面会显示"已回复"
+  // 却什么都没有）⇒ 整条丢掉，不修（修补出来的数据是假的）。
+  if (raw.status === 'replied' && typeof raw.reply !== 'string') {
     return undefined
   }
   if (raw.repliedAt !== undefined && (typeof raw.repliedAt !== 'number' || !Number.isFinite(raw.repliedAt))) {
