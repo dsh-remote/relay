@@ -22,8 +22,10 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws'
 import { type EndpointFrame, type ErrorCode, type RelayFrame, type StatusDigest } from '@dsh-remote/protocol/frames'
 import { newHostId } from '@dsh-remote/protocol/ids'
 import { negotiateProtocol, PROTOCOL_VERSION } from '@dsh-remote/protocol/negotiate'
+import { CAPABILITY_NOTIFY, RELAY_CAPABILITIES } from '@dsh-remote/protocol/registry'
 import { createMpCodeIssuer } from './mpcode.js'
-import { FeedbackStore } from './feedback.js'
+import { createNotifier } from './notify.js'
+import { createWechatTokenProvider } from './wechat-token.js'
 import { createHttpRoutes } from './http-routes.js'
 import { createSweep } from './sweep.js'
 import { wantsRetryAfter } from '@dsh-remote/protocol/errors'
@@ -32,7 +34,6 @@ import {
   encBatchToRelay,
   encToClient,
   encToRelay,
-  feedbackList as feedbackListFrameOf,
   helloOkForClient,
   helloOkForHost,
   makeError as makeErrorFrame,
@@ -198,24 +199,35 @@ export function createRelay(config: RelayConfig): RelayHandle {
     maxConversations: config.maxConversations,
   })
   const startedAt = Date.now()
+
+  /**
+   * 微信 access_token 的**唯一**缓存（2026-10-27）。
+   *
+   * 小程序码签发与订阅消息发送**共用它** —— 微信的 token 是单例，
+   * 两处各自缓存会互相打死（详见 `wechat-token.ts` 的文件头）。
+   */
+  const wechatTokens = createWechatTokenProvider({ appId: config.mpAppId, secret: config.mpSecret })
+
+  /**
+   * 订阅消息发送器（2026-10-27）。
+   *
+   * **没配模板 id ⇒ 不启用** ⇒ 中继不声明 `notify.v1`、不下发 `hello-ok.notify`
+   * ⇒ 小程序不显示那个开关（按声明开）。
+   */
+  const notifier = createNotifier({
+    appId: config.mpAppId,
+    secret: config.mpSecret,
+    templateId: config.mpApprovalTemplateId,
+    envVersion: config.mpEnv,
+    tokens: wechatTokens,
+    log,
+    membersOf: (conversationId: string) => [...(state.conversations.get(conversationId)?.clients ?? [])],
+  })
+
   const pairBudget = new Budget(config.pairGlobalBudgetPerSec)
   /** `/api/pair-status` 的独立配额：它走 HTTP、无认证，和配对帧不是同一条入口。 */
   const pairStatusBudget = new Budget(config.pairStatusBudgetPerSec)
   const peers = new WeakMap<WebSocket, Peer>()
-  /**
-   * 反馈存储（2026-10-26）。**明文**的独立失败域，文件与 state.json 分开。
-   *
-   * 启动读回放在这里（与 `restoreState` 同一时机：listen 之前，还没有 socket 能进来）。
-   * 路径为空（`DRC_STATE_FILE` 与 `DRC_FEEDBACK_FILE` 都没设）⇒ 只在内存里。
-   */
-  const feedback = new FeedbackStore({
-    path: config.feedbackFile,
-    maxEntries: config.feedbackMaxEntries,
-    perClientPerHour: config.feedbackPerClientPerHour,
-    perIpPerHour: config.feedbackPerIpPerHour,
-    log,
-  })
-  feedback.load()
   let shuttingDown = false
   let sweepTimer: NodeJS.Timeout | undefined
   let pingTimer: NodeJS.Timeout | undefined
@@ -507,10 +519,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
     history_window_exceeded: '断线时间太长，中间那段已经补不回来了，正在重新拉取',
     pair_table_full: '配对表已满，请稍后再试',
     need_client: '需要先从手机侧发起配对',
-    // 反馈面（2026-10-26）：**绝不能**让客户端把它当成"配对失效"——
-    // `unknown_session` 会触发"清配对并要求重扫"，而这里配对是好的，
-    // 只是这一条业务动作没资格做（提示"先配对再反馈"就够了）。
-    not_paired: '请先完成配对后再提交反馈',
     unsupported_protocol: '中继与手机的协议版本不兼容，请把小程序升级到最新版',
     internal: '中继内部错误',
   }
@@ -659,10 +667,21 @@ export function createRelay(config: RelayConfig): RelayHandle {
    * 手机侧措辞面）。没挂会话（新手机）或没摘要（老主机/还没推过）⇒ 什么都不带，
    * 老端点对多出来的键零感知（zod strip / 旧 switch 直接忽略）。
    */
-  function helloExtrasForClient(clientId: string): { summary?: StatusDigest } {
+  function helloExtrasForClient(clientId: string): {
+    summary?: StatusDigest
+    capabilities?: readonly string[]
+    notify?: { templateId: string }
+  } {
     const conversationId = state.conversationOfClient(clientId)
     const summary = conversationId ? state.conversations.get(conversationId)?.summary : undefined
-    return summary === undefined ? {} : { summary }
+    // 通知面（2026-10-27）：**只有 notifier 启用时才声明** ——
+    // 声明了却发不出去比不声明更坏（用户看到开关、点了没反应）。
+    const notifyEnabled = notifier.enabled
+    return {
+      ...(summary === undefined ? {} : { summary }),
+      ...(notifyEnabled ? { capabilities: [...RELAY_CAPABILITIES, CAPABILITY_NOTIFY] } : {}),
+      ...(notifyEnabled ? { notify: { templateId: config.mpApprovalTemplateId } } : {}),
+    }
   }
 
   function handleHello(peer: Peer, frame: Extract<EndpointFrame, { t: 'hello' }>): void {
@@ -1296,75 +1315,72 @@ export function createRelay(config: RelayConfig): RelayHandle {
         return
       }
       /**
-       * 提交一条反馈（2026-10-26）。**明文**——这是中继唯一读得懂的自由文本。
+       * 订阅消息：登记订阅（2026-10-27）。
        *
-       * ## 资格闸：**必须已配对**（产品裁决）
-       *
-       * 判据是"这个 clientId 是不是某条活跃会话的成员"
-       * （`state.conversationOfClient`）。成员身份不是自报能拿到的 ——
-       * 它要求真走过一次扫码 + SAS 确认（`claim()` 里由主机授权写入成员表）。
-       *
-       * 为什么要这道门：客户端**无鉴权**（clientId 是自报的，见 handleHello 客户端分支），
-       * 没有这道门的话这就是一台公网留言板。
-       *
-       * ## 幂等：同 id 再来一次 = 重发，不是新的一条
-       *
-       * 小程序在网络抖动时会重发同一条；重发不该变成两条反馈（用户只按了一次）。
-       * 而"用户看到失败又按一次"会生成**两个不同的 id**（那是两条反馈，不该被合并）。
+       * **仅 client 可发**。`code` 是 `wx.login` 的一次性 code，中继拿它换 openid。
+       * ⚠️ **不记 code、不记 openid**（notifier 内部已经保证）。
+       * ⚠️ 失败**只记日志、不回错误**（计划 §4.1）：换不到 openid 对用户没有
+       *   可执行动作，回一个错误只会让小程序弹一句"失败"，而那对"没授权"没用。
        */
-      case 'feedback': {
+      case 'notify-register': {
         if (peer.role !== 'client' || !peer.clientId) {
           sendError(peer, 'need_client')
           return
         }
-        if (state.conversationOfClient(peer.clientId) === undefined) {
-          // 未配对 ⇒ 没资格。回 `not_paired`（**不是** `unknown_session`：
-          // 后者会让客户端清配对要求重扫，而这里配对是好的）。
-          sendError(peer, 'not_paired')
+        if (!notifier.enabled) {
+          // 中继没启用通知面（没配模板 id）⇒ 静默忽略，不给用户一个假错误。
+          log.debug('notify register ignored: notifier disabled', { clientId: peer.clientId })
           return
         }
-        const added = feedback.add(
-          peer.clientId,
-          peer.ip,
-          { id: frame.id, text: frame.text, contact: frame.contact },
-          Date.now(),
-        )
-        if (!added.ok) {
-          if (added.reason === 'duplicate') {
-            // 重发：回一份当前列表（内容不变），不当失败。
-            sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
-            return
-          }
-          // 限频：**出声**（rate_limited 带 retryAfterMs），不静默丢 ——
-          // 静默丢会让用户以为提交成功了。
-          sendError(peer, 'rate_limited', undefined, undefined, 60_000)
-          return
-        }
-        const sla = feedback.slaCounts(Date.now())
-        log.info('feedback received', {
-          id: frame.id,
-          clientId: peer.clientId,
-          chars: frame.text.length,
-          hasContact: frame.contact !== undefined ? 1 : 0,
-          open: sla.open,
-          overdue: sla.overdue,
+        void notifier.register(peer.clientId, frame.code, frame.subscribed === true).catch((e: unknown) => {
+          log.warn('notify register failed', {
+            clientId: peer.clientId,
+            message: String((e as Error)?.message ?? e),
+          })
         })
-        // 回包：把"我的反馈"整份发回去（用户立刻能看到"已收到"）。
-        sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
         return
       }
       /**
-       * 拉取"我的反馈"（含已回复的那些）。
+       * 订阅消息：主机请求发通知（2026-10-27）。
        *
-       * 列表**只含这个 clientId 自己的**条目（`listFor` 里按 clientId 过滤）——
-       * 反馈是明文，"谁能看到谁的反馈"必须在中继这一侧就定死。
+       * **仅 host 可发**，且**会话必须属于这台主机** —— 否则任意一台主机都能
+       * 让中继给别人的手机发通知（那是**骚扰**面，不只是"多发一条"）。
+       *
+       * ⚠️ 会话对不上**静默丢**（与 `summary` 那条同款纪律）：对主机说
+       *   `unknown_session` 没有可执行动作，而回错误会和它的消费语义打架。
+       * ⚠️ **不回执**（计划 §4.2）：v1 不做"发送失败重试"，主机那边靠自己的
+       *   "这张卡通知过了"标记去重。
        */
-      case 'feedback-poll': {
-        if (peer.role !== 'client' || !peer.clientId) {
-          sendError(peer, 'need_client')
+      case 'notify-approval': {
+        if (peer.role !== 'host' || !peer.hostId) {
+          sendError(peer, 'need_host')
           return
         }
-        sendToPeer(peer, feedbackListFrameOf(feedback.listFor(peer.clientId)))
+        const conv = state.conversations.get(frame.conversationId)
+        if (!conv || conv.hostId !== peer.hostId) {
+          log.warn('notify approval ignored: conversation not owned by this host', {
+            hostId: peer.hostId,
+            conversationId: frame.conversationId,
+          })
+          return
+        }
+        if (!notifier.enabled) {
+          log.debug('notify approval ignored: notifier disabled', { hostId: peer.hostId })
+          return
+        }
+        void notifier
+          .notify({
+            hostId: peer.hostId,
+            conversationId: frame.conversationId,
+            items: frame.items,
+          })
+          .catch((e: unknown) => {
+            log.warn('notify approval failed', {
+              hostId: peer.hostId,
+              conversationId: frame.conversationId,
+              message: String((e as Error)?.message ?? e),
+            })
+          })
         return
       }
       case 'ping':
@@ -1609,39 +1625,13 @@ export function createRelay(config: RelayConfig): RelayHandle {
   const sweepPingBucket = sweepMod.sweepPingBucket
 
   // ── HTTP（v5 R3 抽出 → `http-routes.ts`）────────────────────────────
-  const mpCodes = createMpCodeIssuer({ appId: config.mpAppId, secret: config.mpSecret, envVersion: config.mpEnv })
-  /**
-   * 回一条反馈（运维面）。返回 `{ok, error?}`。
-   *
-   * 回完之后**顺手推给那台在线的手机**（`feedback-list`）——用户提交完意见
-   * 很可能还开着小程序，这时他应该立刻看到"我们收到并回复了"。
-   * 手机不在线也没关系：它下次 poll 会拿到同一份列表（回复是**状态**，
-   * 不是一次性事件 —— 所以列表是权威，推送只是加速）。
-   */
-  function replyToFeedback(id: string, text: string): { ok: boolean; error?: string; clientId?: string } {
-    const entry = feedback.get(id)
-    if (entry === undefined) return { ok: false, error: 'not_found' }
-    const now = Date.now()
-    if (!feedback.reply(id, text, now)) return { ok: false, error: 'not_found' }
-    const sock = state.clients.get(entry.clientId)?.ws
-    if (sock !== undefined) {
-      try {
-        sendTo(sock, feedbackListFrameOf(feedback.listFor(entry.clientId)))
-      } catch (e) {
-        // 推不出去不是回复失败（回复已经落盘了，手机下次 poll 会看到）。
-        log.warn('feedback reply push failed', { id, message: String((e as Error)?.message ?? e) })
-      }
-    }
-    const sla = feedback.slaCounts(now)
-    log.info('feedback replied', {
-      id,
-      clientId: entry.clientId,
-      online: sock !== undefined ? 1 : 0,
-      overdue: sla.overdue,
-    })
-    return { ok: true, clientId: entry.clientId }
-  }
-
+  const mpCodes = createMpCodeIssuer({
+    appId: config.mpAppId,
+    secret: config.mpSecret,
+    envVersion: config.mpEnv,
+    // 与订阅消息**共用**同一个 token 缓存（微信的 token 是单例）。
+    tokens: wechatTokens,
+  })
   const { handler: httpHandler, health } = createHttpRoutes({
     config,
     state,
@@ -1650,8 +1640,6 @@ export function createRelay(config: RelayConfig): RelayHandle {
     mpCodes,
     pairStatusBudget,
     persistence,
-    feedback,
-    replyToFeedback,
     getShuttingDown: () => shuttingDown,
     startedAt,
     getLastPingAt: () => sweepMod.getLastPingAt(),

@@ -13,6 +13,8 @@
  * 3. **按 token 缓存图片**：同一张配对码在它的 TTL 内被请求多次（页面轮询、重绘）是常态，
  *    每次都调微信既慢又吃配额（10 万/天）。
  */
+import { createWechatTokenProvider, type WechatTokenProvider } from './wechat-token.js'
+
 /**
  * 只用到 fetch 的一小部分。写成结构化类型而不是 `typeof fetch`：
  * 测试里注入的假 fetch 不需要实现 Request/Response 的全部重载。
@@ -23,16 +25,10 @@ type FetchLike = (
 ) => Promise<{ json(): Promise<unknown>; arrayBuffer(): Promise<ArrayBuffer> }>
 
 /** 微信接口地址（常量而不是配置：换域名不是运维旋钮）。 */
-const TOKEN_URL = 'https://api.weixin.qq.com/cgi-bin/token'
 const CODE_URL = 'https://api.weixin.qq.com/wxa/getwxacodeunlimit'
 
 /** 小程序里的落地页。**不带前导斜杠**，且必须是已发布版本里存在的页面。 */
 const LANDING_PAGE = 'pages/sessions/sessions'
-
-/** token 提前 60 秒过期，避免"取到就过期"的边界。 */
-const TOKEN_SKEW_MS = 60_000
-/** 微信默认 expires_in=7200s；拿不到就按 7000s 保守处理。 */
-const DEFAULT_TOKEN_TTL_MS = 7_000_000
 
 /**
  * 码要打开哪一版小程序。**默认正式版**（微信接口的默认值），排错/灰度时用 trial 或 develop。
@@ -60,6 +56,14 @@ export interface MpCodeIssuerOptions {
   /** 注入点：测试用假 fetch，生产用全局 fetch。 */
   fetch?: FetchLike
   now?: () => number
+  /**
+   * **共用**的 access_token 缓存（2026-10-27）。
+   *
+   * 缺省时自己建一个（单包自用）；中继装配时会把**同一个**实例传给
+   * 订阅消息发送器 —— 微信的 token 是单例，两处各自缓存会互相打死
+   * （详见 `wechat-token.ts` 的文件头）。
+   */
+  tokens?: WechatTokenProvider
 }
 
 export interface MpCodeIssuer {
@@ -67,11 +71,6 @@ export interface MpCodeIssuer {
   codeFor(pairingToken: string): Promise<Uint8Array>
   /** 是否配置了凭据。没配时路由直接 501，不尝试调用。 */
   readonly enabled: boolean
-}
-
-interface CachedToken {
-  value: string
-  expiresAt: number
 }
 
 /**
@@ -85,34 +84,16 @@ export function createMpCodeIssuer(options: MpCodeIssuerOptions): MpCodeIssuer {
   const doFetch: FetchLike = options.fetch ?? ((...args) => fetch(...args))
   const now = options.now ?? (() => Date.now())
 
-  let cachedToken: CachedToken | undefined
   /** token → 图片 + 过期时刻。键是配对码（一次性），量级等于同时在等的配对。 */
   const images = new Map<string, { bytes: Uint8Array; expiresAt: number }>()
   /** 图片缓存留一小时（配对码 TTL 是分钟级，没必要更久）。 */
   const IMAGE_TTL_MS = 3_600_000
 
-  async function fetchToken(): Promise<string> {
-    const url = `${TOKEN_URL}?grant_type=client_credential&appid=${encodeURIComponent(appId)}&secret=${encodeURIComponent(secret)}`
-    const response = await doFetch(url)
-    const body = (await response.json()) as {
-      access_token?: string
-      expires_in?: number
-      errcode?: number
-      errmsg?: string
-    }
-    if (typeof body.access_token !== 'string' || body.access_token === '') {
-      throw new Error(`微信 access_token 获取失败：${body.errcode ?? '?'} ${body.errmsg ?? ''}`.trim())
-    }
-    const ttl =
-      typeof body.expires_in === 'number' && body.expires_in > 0 ? body.expires_in * 1000 : DEFAULT_TOKEN_TTL_MS
-    cachedToken = { value: body.access_token, expiresAt: now() + Math.max(0, ttl - TOKEN_SKEW_MS) }
-    return body.access_token
-  }
-
-  async function token(): Promise<string> {
-    if (cachedToken !== undefined && cachedToken.expiresAt > now()) return cachedToken.value
-    return fetchToken()
-  }
+  /**
+   * access_token 缓存。**与订阅消息发送器共用同一个**（见 `MpCodeIssuerOptions.tokens`）。
+   */
+  const tokens: WechatTokenProvider =
+    options.tokens ?? createWechatTokenProvider({ appId, secret, fetch: doFetch, now })
 
   async function requestCode(accessToken: string, pairingToken: string): Promise<Uint8Array | { errcode: number }> {
     const response = await doFetch(`${CODE_URL}?access_token=${encodeURIComponent(accessToken)}`, {
@@ -148,11 +129,11 @@ export function createMpCodeIssuer(options: MpCodeIssuerOptions): MpCodeIssuer {
       const hit = images.get(pairingToken)
       if (hit !== undefined && hit.expiresAt > now()) return hit.bytes
 
-      let accessToken = await token()
+      let accessToken = await tokens.get()
       let result = await requestCode(accessToken, pairingToken)
       /** 40001/42001 = token 失效。**只重取一次**：再失败就是凭据问题，重试没有意义。 */
       if (!(result instanceof Uint8Array) && (result.errcode === 40001 || result.errcode === 42001)) {
-        accessToken = await fetchToken()
+        accessToken = await tokens.refresh()
         result = await requestCode(accessToken, pairingToken)
       }
       if (!(result instanceof Uint8Array)) {

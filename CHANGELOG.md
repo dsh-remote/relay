@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.5.8 —— 订阅消息发送器：换 openid / 计额度 / 发通知 / 去重 / 频控
+
+> ⚠️ **本包不发 npm**（中继是自部署服务）：分发形态是 **Docker 镜像**与
+> **GitHub Release 的自包含单文件**。
+
+### 新增 `src/notify.ts`
+
+- **openid**：`jscode2session` 换取；**只存内存**（`clientId → openid`），
+  中继重启即丢，不落盘、不进 `healthz`、不写日志。
+- **额度**：每个 openid 最多 3 条；`notify-register subscribed=true` +1；发送成功 −1；
+  重复登记同一个 openid **不重复加分**（否则多开两次页面就能刷额度）。
+- **去重**：`hostId:requestId` 已发集合 ⇒ 同一张卡只发一次（跨主机重启也拦得住）。
+- **频控**：同一 openid 10 分钟冷却 / 每小时 3 条 / 每天 10 条。
+- **43101**（用户拒收或订阅用尽）⇒ 额度清零；40001/42001 ⇒ 刷新 token 重试**一次**；
+  网络错误最多重试一次。
+- **模板正文全是固定文案**（主机带不进任何内容）；单条进 `pages/chat/chat?id=…`，
+  多条进会话列表。
+
+### access_token 缓存**抽成唯一一份**（`src/wechat-token.ts`）
+
+小程序码签发与订阅消息发送**共用同一个缓存**。微信的 token 是单例：同 appid+secret
+再取一次会让上一个 token **立刻失效**（40001）—— 两处各自缓存就会互相打死。
+
+### 配置
+
+`DRC_MP_APPROVAL_TEMPLATE_ID`：**空 = 通知面不启用**（中继不声明 `notify.v1`、
+不下发 `hello-ok.notify` ⇒ 小程序不显示那个开关）。
+
+判据：`tests/notify.test.mjs`（14 条）。
+
+## 0.5.7 —— 移除自建反馈面（改用微信小程序客服）
+
+反馈不再经过中继。0.5.4 起的 `feedback.json`、三帧、`feedback.v1` 能力位、
+`/api/feedback*` 运维接口与 `DRC_FEEDBACK_*` / `DRC_ADMIN_TOKEN` 配置全部删除；
+0.5.6 修的“带回复反馈重启丢失”随功能一起失效（历史记录保留）。
+
+小程序侧保留原 FAB，点击直接走微信原生客服（`<button open-type="contact">`），
+中继不再需要存储、限频、SLA 巡检或管理令牌。0.5.5 新增的三条会话埋点保留。
+
 ## 0.5.6 —— 修一个**线上抓到的真 bug**：带回复的反馈在重启后消失
 
 ### 症状
